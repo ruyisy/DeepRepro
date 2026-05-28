@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+*.env
+
+# Node
+node_modules/
+ui/frontend/node_modules/
+
+# Build outputs
+dist/
+build/
+site/
+ui/frontend/dist/
+
+# Logs and local runs
+logs/
+*.log
+uploads/
+deeprepro_code/
+deepcode_lab/
+paperclaw_code/
+
+# Secrets
+mcp_agent.secrets.yaml
+nanobot_config.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

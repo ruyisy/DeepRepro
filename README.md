@@ -1,6 +1,6 @@
 ﻿![DeepRepro logo](assets/fig_main.png)
 
-DeepRepro is a paper-to-code reproduction framework for automatic ML reproducibility via deep subplanning.
+**DeepRepro is a paper-to-code reproduction framework for automatic ML reproducibility via deep subplanning.**
 It combines paper understanding, round-level subplanning, agentic implementation, memory management, and repair into one observable workflow.
 
 ## Highlights
@@ -16,10 +16,7 @@ It combines paper understanding, round-level subplanning, agentic implementation
 python ./deeprepro.py --local
 ```
 
-This starts the local backend and frontend:
-
-- Frontend: `http://localhost:5173`
-- Backend: `http://localhost:8000`
+This starts the local backend and frontend.
 
 ## Requirements
 

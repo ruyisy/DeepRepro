@@ -83,6 +83,7 @@ interface WorkflowState {
     executor: 'idle' | 'active';
     memory: 'idle' | 'active';
     activeRole: 'idle' | 'planner' | 'executor' | 'memory';
+    phase: string;
     message: string;
     memoryMessage: string;
   };
@@ -152,6 +153,7 @@ const initialState = {
     executor: 'idle' as const,
     memory: 'idle' as const,
     activeRole: 'idle' as const,
+    phase: '',
     message: '',
     memoryMessage: '',
   },
@@ -290,6 +292,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       }
 
       if (event === 'agent_state') {
+        const phase = String(payload.phase || '');
         agentState = {
           ...state.agentState,
           planner: payload.planner === 'active' ? 'active' : 'idle',
@@ -301,8 +304,12 @@ export const useWorkflowStore = create<WorkflowState>()(
               : state.agentState.memory === 'active'
               ? 'memory'
               : 'idle',
+          phase,
           message: String(payload.message || ''),
         };
+        if (phase === 'quality_gate' || phase === 'quality_repair_planning' || phase === 'quality_repair_execution') {
+          currentStage = 'quality_gate';
+        }
       }
 
       if (event === 'memory_state') {

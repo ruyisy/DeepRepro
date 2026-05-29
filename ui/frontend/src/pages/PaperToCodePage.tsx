@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
 import {
   AlertCircle,
@@ -170,6 +170,7 @@ const STAGE_META: Record<string, { title: string; description: string; icon: typ
   planning: { title: 'Planning', description: 'Generate file tree and roadmap', icon: FileText },
   reference_indexing: { title: 'Reference & Indexing', description: 'Fetch repositories and build code memory', icon: Search },
   implementation: { title: 'Implementation', description: 'Write, repair, and summarize files', icon: Code2 },
+  quality_gate: { title: 'Final Gate', description: 'Run final quality checks and bounded repairs', icon: ShieldCheck },
   idle: { title: 'Ready', description: 'Waiting for a paper', icon: CircleDot },
 };
 

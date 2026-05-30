@@ -4,7 +4,7 @@
 
 # DeepRepro
 
-### Automatic ML Paper-to-Code Reproduction via Deep Subplanning
+### State-Aware Subplanning for Paper Reproduction in Evolving Repositories
 
 <p>
   <a href="#quick-start">Quick Start</a> ·
@@ -45,6 +45,35 @@ Fast modes keep the loop lightweight. DeepPlan modes add a subplan agent that wr
 
 ## Quick Start
 
+### 1. Prepare the environment
+
+DeepRepro requires:
+
+- Python 3.9+
+- Node.js and npm
+- A local model/API configuration in `mcp_agent.config.yaml` and `mcp_agent.secrets.yaml`
+
+Install the Python dependencies first:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Install the frontend dependencies:
+
+```bash
+cd ui/frontend
+npm install
+cd ../..
+```
+
+### 2. Configure model access
+
+Edit `mcp_agent.secrets.yaml` and fill in the provider API key(s) you want to use locally.  
+Then adjust `mcp_agent.config.yaml` if you want to change providers, model names, proxy settings, or MCP server settings.
+
+### 3. Start DeepRepro
+
 ```bash
 python ./deeprepro.py --local
 ```
@@ -58,6 +87,8 @@ This starts the local backend and frontend.
 
 - Python 3.9+
 - Node.js and npm
+- Python packages from `requirements.txt`
+- Frontend packages from `ui/frontend/package.json`
 - Local model configuration in `mcp_agent.config.yaml` and `mcp_agent.secrets.yaml`
 
 ## Configuration
@@ -86,5 +117,4 @@ DeepRepro is built on top of [HKUDS/DeepCode](https://github.com/HKUDS/DeepCode)
 ## License
 
 See `LICENSE` for details.
-
 

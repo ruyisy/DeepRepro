@@ -21,6 +21,9 @@ import logging
 import os
 import time
 import asyncio
+import hashlib
+from pathlib import Path
+from utils.checkpoints import relative_code_path, save_json
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -120,6 +123,7 @@ class ConciseMemoryAgent:
 
         # Store Next Steps information temporarily (not saved to file)
         self.current_next_steps = ""
+        self.restore_implementation_progress()
 
         self.logger.info(
             f"Concise Memory Agent initialized with target directory: {self.save_path}"
@@ -1000,6 +1004,7 @@ class ConciseMemoryAgent:
             file_path: Path of the implemented file
             implementation_content: Content of the implemented file
         """
+        file_path = relative_code_path(file_path, self.code_directory)
         # Add file to implemented files list if not already present
         if file_path not in self.implemented_files:
             self.implemented_files.append(file_path)
@@ -1008,6 +1013,24 @@ class ConciseMemoryAgent:
             self.all_files_list = sorted(self.all_files_list)
 
         self.logger.info(f"File implementation recorded: {file_path}")
+        self.save_implementation_progress(self.current_round)
+
+    def restore_implementation_progress(self):
+        """Trust only confirmed writes whose contents still match the checkpoint."""
+        path = Path(self.implementation_progress_path)
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.current_round = int(data.get("current_round", 0))
+            for name, digest in data.get("file_hashes", {}).items():
+                name = relative_code_path(name, self.code_directory)
+                file = Path(self.code_directory) / name
+                if file.is_file() and hashlib.sha256(file.read_bytes()).hexdigest() == digest:
+                    self.implemented_files.append(name)
+            self.all_files_list = sorted(set(self.all_files_list + self.implemented_files))
+        except (OSError, ValueError, TypeError) as error:
+            self.logger.warning(f"Could not restore implementation progress: {error}")
 
     async def create_code_implementation_summary(
         self,
@@ -1947,9 +1970,13 @@ Use `write_file` once per file. If Next Steps lists multiple files, implement th
                     "updated_at": datetime.now().isoformat(timespec="seconds"),
                 }
             )
+            progress["file_hashes"] = {
+                name: hashlib.sha256((Path(self.code_directory) / name).read_bytes()).hexdigest()
+                for name in self.implemented_files
+                if (Path(self.code_directory) / name).is_file()
+            }
             os.makedirs(os.path.dirname(self.implementation_progress_path), exist_ok=True)
-            with open(self.implementation_progress_path, "w", encoding="utf-8") as f:
-                json.dump(progress, f, ensure_ascii=False, indent=2)
+            save_json(self.implementation_progress_path, progress)
         except Exception as e:
             self.logger.error(f"Failed to save implementation progress: {e}")
 
@@ -2237,72 +2264,10 @@ Hard rules:
         return False
 
     def get_unimplemented_files(self) -> List[str]:
-        """
-        Get list of files that haven't been implemented yet
-        Uses fuzzy path matching to handle partial paths
-
-        Returns:
-            List of file paths that still need to be implemented
-        """
-
-        # def is_implemented(plan_file: str) -> bool:
-        #     """Check if a file from plan is implemented (with fuzzy matching)"""
-        #     # Normalize paths for comparison
-        #     plan_file_normalized = plan_file.replace("\\", "/").strip("/")
-        #     plan_filename = plan_file_normalized.split("/")[-1]  # Extract filename
-
-        #     for impl_file in self.implemented_files:
-        #         impl_file_normalized = impl_file.replace("\\", "/").strip("/")
-        #         impl_filename = impl_file_normalized.split("/")[-1]  # Extract filename
-
-        #         # Strategy 1: Exact path match
-        #         if plan_file_normalized == impl_file_normalized:
-        #             return True
-
-        #         # Strategy 2: One path ends with the other (partial path match)
-        #         if plan_file_normalized.endswith(
-        #             impl_file_normalized
-        #         ) or impl_file_normalized.endswith(plan_file_normalized):
-        #             # Ensure match is at a path boundary (not middle of directory name)
-        #             if (
-        #                 plan_file_normalized.endswith("/" + impl_file_normalized)
-        #                 or impl_file_normalized.endswith("/" + plan_file_normalized)
-        #             ):
-        #                 return True
-
-        #         # Strategy 3: Same filename (fallback for different directory structures)
-        #         # Only match if filenames are identical and reasonably unique (length > 5)
-        #         if (plan_filename == impl_filename and len(plan_filename) > 5):
-        #             return True
-
-        #     return False
-        def is_implemented(plan_file: str) -> bool:
-            """Check if a file from plan is implemented (with fuzzy matching)"""
-            # Normalize paths for comparison
-            plan_file_normalized = plan_file.replace("\\", "/").strip("/")
-
-            for impl_file in self.implemented_files:
-                impl_file_normalized = impl_file.replace("\\", "/").strip("/")
-
-                # Check if plan_file ends with impl_file (partial path match)
-                # or impl_file ends with plan_file (reverse partial match)
-                if plan_file_normalized.endswith(
-                    impl_file_normalized
-                ) or impl_file_normalized.endswith(plan_file_normalized):
-                    # Ensure match is at a path boundary (not middle of directory name)
-                    if (
-                        plan_file_normalized.endswith("/" + impl_file_normalized)
-                        or plan_file_normalized == impl_file_normalized
-                        or impl_file_normalized.endswith("/" + plan_file_normalized)
-                    ):
-                        return True
-            return False
-
-        # unimplemented = [f for f in self.all_files_list if not is_implemented(f)]
-        # return unimplemented
-
-        unimplemented = [f for f in self.all_files_list if not is_implemented(f)]
-        return unimplemented
+        """Compare canonical workspace paths, keeping same-name subfiles distinct."""
+        implemented = set(self.implemented_files)
+        return [name for name in self.all_files_list
+                if relative_code_path(name, self.code_directory) not in implemented]
 
     def get_formatted_files_lists(self) -> Dict[str, str]:
         """

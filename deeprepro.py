@@ -15,11 +15,13 @@ import socket
 import subprocess
 import sys
 import time
+import json
 from pathlib import Path
 
 
 BACKEND_PORT = 8000
 FRONTEND_PORT = 5173
+RUNTIME_FILE = Path(__file__).resolve().parent / "logs" / "demo-runtime.json"
 
 _backend_process: subprocess.Popen | None = None
 _frontend_process: subprocess.Popen | None = None
@@ -98,40 +100,10 @@ def is_port_in_use(port: int) -> bool:
         return sock.connect_ex(("localhost", port)) == 0
 
 
-def kill_process_on_port(port: int) -> None:
-    try:
-        if get_platform() == "windows":
-            result = subprocess.run(
-                f"netstat -ano | findstr :{port}",
-                capture_output=True,
-                text=True,
-                shell=True,
-            )
-            for line in result.stdout.strip().splitlines():
-                parts = line.split()
-                if len(parts) >= 5 and parts[-1].isdigit():
-                    subprocess.run(
-                        f"taskkill /F /PID {parts[-1]}",
-                        shell=True,
-                        capture_output=True,
-                    )
-        else:
-            result = subprocess.run(
-                f"lsof -ti :{port}", capture_output=True, text=True, shell=True
-            )
-            for pid in result.stdout.strip().splitlines():
-                if pid.isdigit():
-                    os.kill(int(pid), signal.SIGKILL)
-    except Exception as exc:
-        print(f"Warning: could not clean port {port}: {exc}")
-
-
 def cleanup_ports() -> None:
     for port in [BACKEND_PORT, FRONTEND_PORT]:
         if is_port_in_use(port):
-            print(f"Port {port} is in use; stopping the existing process.")
-            kill_process_on_port(port)
-            time.sleep(1)
+            raise RuntimeError(f"Port {port} is already in use. Stop the existing demo before restarting.")
 
 
 def install_frontend_deps(frontend_dir: Path) -> None:
@@ -154,7 +126,7 @@ def start_backend(backend_dir: Path) -> bool:
     print("Starting DeepRepro backend...")
     if get_platform() == "windows":
         _backend_process = subprocess.Popen(
-            f'"{sys.executable}" -m uvicorn main:app --host 0.0.0.0 --port {BACKEND_PORT} --reload',
+            f'"{sys.executable}" -m uvicorn main:app --host 127.0.0.1 --port {BACKEND_PORT}',
             cwd=backend_dir,
             shell=True,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
@@ -167,19 +139,25 @@ def start_backend(backend_dir: Path) -> bool:
                 "uvicorn",
                 "main:app",
                 "--host",
-                "0.0.0.0",
+                "127.0.0.1",
                 "--port",
                 str(BACKEND_PORT),
-                "--reload",
             ],
             cwd=backend_dir,
             start_new_session=True,
         )
 
-    time.sleep(2)
-    if _backend_process.poll() is None:
-        print(f"Backend ready: http://localhost:{BACKEND_PORT}")
-        return True
+    import urllib.request
+    for _ in range(30):
+        if _backend_process.poll() is not None:
+            break
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{BACKEND_PORT}/health", timeout=1) as response:
+                if response.status == 200:
+                    print(f"Backend ready: http://localhost:{BACKEND_PORT}")
+                    return True
+        except OSError:
+            time.sleep(0.5)
 
     print("Backend failed to start.")
     return False
@@ -226,7 +204,7 @@ def stop_process(name: str, process: subprocess.Popen | None) -> None:
             )
         else:
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            process.wait(timeout=5)
+            process.wait(timeout=15)
         print(f"{name} stopped.")
     except Exception:
         process.kill()
@@ -237,9 +215,31 @@ def cleanup_processes() -> None:
     print("\nStopping DeepRepro services...")
     stop_process("Backend", _backend_process)
     stop_process("Frontend", _frontend_process)
-    for port in [BACKEND_PORT, FRONTEND_PORT]:
-        if is_port_in_use(port):
-            kill_process_on_port(port)
+    if RUNTIME_FILE.exists():
+        try:
+            if json.loads(RUNTIME_FILE.read_text()).get("launcher_pid") == os.getpid():
+                RUNTIME_FILE.unlink()
+        except (ValueError, OSError):
+            pass
+
+
+def process_identity(pid: int) -> str:
+    """Include process start time to reject a stale, reused PID (macOS/Linux)."""
+    result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="], capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def stop_local() -> None:
+    if not RUNTIME_FILE.exists():
+        print("No managed DeepRepro service is running.")
+        return
+    runtime = json.loads(RUNTIME_FILE.read_text())
+    pid = runtime["launcher_pid"]
+    if not runtime.get("identity") or process_identity(pid) != runtime["identity"]:
+        print("The recorded launcher is no longer running. No other process was stopped.")
+        return
+    os.kill(pid, signal.SIGTERM)
+    print("Stopping DeepRepro. Running tasks will keep their checkpoints.")
 
 
 def launch_local() -> None:
@@ -267,6 +267,10 @@ def launch_local() -> None:
             cleanup_processes()
             sys.exit(1)
 
+        if os.name != "nt":
+            from utils.checkpoints import save_json
+            save_json(RUNTIME_FILE, {"launcher_pid": os.getpid(), "identity": process_identity(os.getpid())})
+
         print("\nDeepRepro is running.")
         print(f"  Frontend: http://localhost:{FRONTEND_PORT}")
         print(f"  Backend:  http://localhost:{BACKEND_PORT}")
@@ -288,9 +292,15 @@ def launch_local() -> None:
 
 
 def main() -> None:
+    if len(sys.argv) == 2 and sys.argv[1] == "--stop" and os.name != "nt":
+        stop_local()
+        return
     if len(sys.argv) != 2 or sys.argv[1] != "--local":
-        print("Usage: python ./deeprepro.py --local")
+        print("Usage: python ./deeprepro.py --local | --stop")
         sys.exit(1)
+    def request_shutdown(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, request_shutdown)
     launch_local()
 
 

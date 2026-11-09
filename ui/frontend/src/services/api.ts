@@ -68,6 +68,12 @@ export const workflowsApi = {
     return response.data;
   },
 
+  pause: async (taskId: string): Promise<void> => {
+    await api.post(`/workflows/pause/${taskId}`);
+  },
+  resume: async (taskId: string): Promise<void> => {
+    await api.post(`/workflows/resume/${taskId}`);
+  },
   cancel: async (taskId: string): Promise<void> => {
     await api.post(`/workflows/cancel/${taskId}`);
   },

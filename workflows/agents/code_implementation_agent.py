@@ -10,6 +10,7 @@ import time
 import logging
 import asyncio
 from typing import Dict, Any, List, Optional
+from utils.checkpoints import relative_code_path
 
 # Import tiktoken for token calculation
 try:
@@ -421,7 +422,8 @@ class CodeImplementationAgent:
             result: Result of the tool execution
         """
         # First do the regular tracking
-        self._track_file_implementation(tool_call, result)
+        if not self._track_file_implementation(tool_call, result):
+            return
 
         # Then create and save code summary if memory agent is available
         if self.memory_agent and self.llm_client and self.llm_client_type:
@@ -475,8 +477,18 @@ class CodeImplementationAgent:
             self.pending_summary_tasks.remove(task)
         try:
             task.result()
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
             self.logger.error(f"Async code summary task failed: {e}")
+
+    async def cancel_pending_summaries(self):
+        """Stop detached summary requests when their parent workflow exits."""
+        pending = list(self.pending_summary_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def wait_for_pending_summaries(self):
         """Wait until all queued file summaries are persisted."""
@@ -490,101 +502,32 @@ class CodeImplementationAgent:
         await asyncio.gather(*pending_tasks, return_exceptions=True)
 
     def _track_file_implementation(self, tool_call: Dict, result: Any):
-        """
-        Track file implementation progress
-        """
+        """Count and checkpoint only a confirmed successful write."""
         try:
-            # Handle different result types from MCP
-            result_data = None
-
-            # Check if result is a CallToolResult object
+            if getattr(result, "isError", False):
+                return False
             if hasattr(result, "content"):
-                # Extract content from CallToolResult
-                if hasattr(result.content, "text"):
-                    result_content = result.content.text
-                else:
-                    result_content = str(result.content)
-
-                # Try to parse as JSON
-                try:
-                    result_data = json.loads(result_content)
-                except json.JSONDecodeError:
-                    # If not JSON, create a structure
-                    result_data = {
-                        "status": "success",
-                        "file_path": tool_call["input"].get("file_path", "unknown"),
-                    }
-            elif isinstance(result, str):
-                # Try to parse string result
-                try:
-                    result_data = json.loads(result)
-                except json.JSONDecodeError:
-                    result_data = {
-                        "status": "success",
-                        "file_path": tool_call["input"].get("file_path", "unknown"),
-                    }
-            elif isinstance(result, dict):
-                # Direct dictionary result
-                result_data = result
-            else:
-                # Fallback: assume success and extract file path from input
-                result_data = {
-                    "status": "success",
-                    "file_path": tool_call["input"].get("file_path", "unknown"),
-                }
-
-            # Extract file path for tracking
-            file_path = None
-            if result_data and result_data.get("status") == "success":
-                file_path = result_data.get(
-                    "file_path", tool_call["input"].get("file_path", "unknown")
-                )
-            else:
-                file_path = tool_call["input"].get("file_path")
-
-            # Only count unique files, not repeated tool calls on same file
-            if file_path and file_path not in self.implemented_files_set:
-                # This is a new file implementation
+                result = "\n".join(getattr(block, "text", "") for block in result.content)
+            data = json.loads(result) if isinstance(result, str) else result
+            if not isinstance(data, dict) or data.get("status") != "success":
+                return False
+            file_path = data.get("file_path") or tool_call["input"].get("file_path")
+            if not file_path:
+                return False
+            if self.memory_agent:
+                file_path = relative_code_path(file_path, self.memory_agent.code_directory)
+                self.memory_agent.record_file_implementation(file_path)
+            if file_path not in self.implemented_files_set:
                 self.implemented_files_set.add(file_path)
-                self.files_implemented_count += 1
-                # self.logger.info(f"New file implementation tracked: count={self.files_implemented_count}, file={file_path}")
-                # print(f"New file implementation tracked: count={self.files_implemented_count}, file={file_path}")
-
-                # Add to completed files list
-                self.implementation_summary["completed_files"].append(
-                    {
-                        "file": file_path,
-                        "iteration": self.files_implemented_count,
-                        "timestamp": time.time(),
-                        "size": result_data.get("size", 0) if result_data else 0,
-                    }
-                )
-
-                # self.logger.info(
-                #     f"New file implementation tracked: count={self.files_implemented_count}, file={file_path}"
-                # )
-                # print(f"📝 NEW FILE IMPLEMENTED: count={self.files_implemented_count}, file={file_path}")
-                # print(f"🔧 OPTIMIZATION NOW ENABLED: files_implemented_count > 0 = {self.files_implemented_count > 0}")
-            elif file_path and file_path in self.implemented_files_set:
-                # This file was already implemented (duplicate tool call)
-                self.logger.debug(
-                    f"File already tracked, skipping duplicate count: {file_path}"
-                )
-            else:
-                # No valid file path found
-                self.logger.warning("No valid file path found for tracking")
-
-        except Exception as e:
-            self.logger.warning(f"Failed to track file implementation: {e}")
-            # Even if tracking fails, try to count based on tool input (but check for duplicates)
-
-            file_path = tool_call["input"].get("file_path")
-            if file_path and file_path not in self.implemented_files_set:
-                self.implemented_files_set.add(file_path)
-                self.files_implemented_count += 1
-                self.logger.info(
-                    f"File implementation counted (emergency fallback): count={self.files_implemented_count}, file={file_path}"
-                )
+                self.files_implemented_count = len(self.implemented_files_set)
+                self.implementation_summary["completed_files"].append({
+                    "file": file_path, "iteration": self.files_implemented_count,
+                    "timestamp": time.time(), "size": data.get("size_bytes", 0),
+                })
+            return True
+        except (ValueError, TypeError, OSError) as error:
+            self.logger.warning(f"Cannot checkpoint file write: {error}")
+            return False
 
     def _track_dependency_analysis(self, tool_call: Dict, result: Any):
         """

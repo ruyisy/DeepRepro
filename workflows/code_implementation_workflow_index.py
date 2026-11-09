@@ -573,7 +573,7 @@ Requirements:
             if not (openai_key and openai_key.strip()):
                 return None
             try:
-                from openai import AsyncOpenAI
+                from utils.openai_client import AsyncOpenAI
 
                 openai_config = self.api_config.get("openai", {})
                 base_url = openai_config.get("base_url")

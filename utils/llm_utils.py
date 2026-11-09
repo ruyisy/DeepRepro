@@ -95,9 +95,9 @@ def _get_llm_class(provider: str) -> Type[Any]:
 
         return AnthropicAugmentedLLM
     elif provider == "openai":
-        from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
+        from utils.openai_client import configure_mcp_openai_client
 
-        return OpenAIAugmentedLLM
+        return configure_mcp_openai_client()
     elif provider == "google":
         from mcp_agent.workflows.llm.augmented_llm_google import GoogleAugmentedLLM
 

@@ -13,6 +13,7 @@ MCP Architecture:
 
 import ast
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -78,6 +79,8 @@ class CodeImplementationWorkflow:
         self.default_models = get_default_models(self.main_config_path)
         self.logger = self._create_logger()
         self.mcp_agent = None
+        self._code_agent = None
+        self._implementation_client = None
         self.enable_read_tools = (
             True  # Default value, will be overridden by run_workflow parameter
         )
@@ -179,7 +182,7 @@ class CodeImplementationWorkflow:
     def _check_file_tree_exists(self, target_directory: str) -> bool:
         """Check if file tree structure already exists"""
         code_directory = os.path.join(target_directory, "generate_code")
-        return os.path.exists(code_directory) and len(os.listdir(code_directory)) > 0
+        return os.path.isdir(code_directory) and (Path(target_directory) / "file_tree_ready.json").is_file()
 
     # ==================== 2. Public Interface Methods (External API Layer) ====================
 
@@ -225,6 +228,8 @@ class CodeImplementationWorkflow:
                 results["file_tree"] = await self.create_file_structure(
                     plan_content, target_directory
                 )
+                from utils.checkpoints import save_json
+                save_json(Path(target_directory) / "file_tree_ready.json", {"complete": True})
 
             # Code implementation
             if pure_code_mode:
@@ -235,6 +240,8 @@ class CodeImplementationWorkflow:
             else:
                 pass
 
+            if any(f.get("severity") == "blocking" for f in self.latest_quality_findings):
+                raise RuntimeError("Final quality gate still has blocking findings; see implementation diagnostics")
             self.logger.info("Workflow execution successful")
 
             return {
@@ -251,7 +258,17 @@ class CodeImplementationWorkflow:
 
             return {"status": "error", "message": str(e), "plan_file": plan_file_path}
         finally:
-            await self._cleanup_mcp_agent()
+            try:
+                if self._code_agent:
+                    await self._code_agent.cancel_pending_summaries()
+                if self._implementation_client:
+                    close = getattr(self._implementation_client, "close", None)
+                    if close:
+                        result = close()
+                        if inspect.isawaitable(result):
+                            await result
+            finally:
+                await self._cleanup_mcp_agent()
 
     async def create_file_structure(
         self, plan_content: str, target_directory: str
@@ -328,6 +345,7 @@ Requirements:
 
         try:
             client, client_type = await self._initialize_llm_client()
+            self._implementation_client = client
             await self._initialize_mcp_agent(code_directory)
 
             tools = self._prepare_mcp_tool_definitions()
@@ -431,14 +449,30 @@ Requirements:
 
         # Connect code agent with memory agent for summary generation
         # Note: Concise memory agent doesn't need LLM client for summary generation
+        self._code_agent = code_agent
         code_agent.set_memory_agent(memory_agent, client, client_type)
 
+        # Resume confirmed files in the original workspace. The in-flight round
+        # starts fresh; planner/executor can inspect these files for interfaces.
+        iteration = memory_agent.current_round
+        code_agent.implemented_files_set = set(memory_agent.get_implemented_files())
+        code_agent.files_implemented_count = len(code_agent.implemented_files_set)
+        if code_agent.implemented_files_set:
+            restored_sources = []
+            for name in sorted(code_agent.implemented_files_set):
+                source = (Path(code_directory) / name).read_text(encoding="utf-8", errors="replace")
+                restored_sources.append(f"### {name}\n{source[:12000]}")
+            messages.append({"role": "user", "content":
+                "Resuming from saved files. Preserve existing interfaces and implement remaining files. "
+                "Inspect files with read_file where needed.\n" + "\n".join(restored_sources)[:60000]})
+
         # Initialize memory agent with iteration 0
-        memory_agent.start_new_round(iteration=0)
+        memory_agent.start_new_round(iteration=iteration)
         self._emit_event(
             "file_progress",
             {
-                "round_id": 0,
+                "round_id": iteration,
+                "all_files": self._get_all_files_list(memory_agent),
                 "implemented_files_count": code_agent.get_files_implemented_count(),
                 "total_files": self._get_total_files_count(memory_agent),
                 "remaining_files_count": len(memory_agent.get_unimplemented_files()),
@@ -913,6 +947,8 @@ Requirements:
                 )
 
         await code_agent.wait_for_pending_summaries()
+        if memory_agent.get_unimplemented_files():
+            raise RuntimeError("Implementation stopped before all planned files were completed")
         self._emit_event(
             "memory_state",
             {
@@ -1079,7 +1115,7 @@ Requirements:
             if not (openai_key and openai_key.strip()):
                 return None
             try:
-                from openai import AsyncOpenAI
+                from utils.openai_client import AsyncOpenAI
 
                 openai_config = self.api_config.get("openai", {})
                 base_url = openai_config.get("base_url")
@@ -1252,6 +1288,10 @@ Requirements:
         closer baseline to the original project. Deepplan may spend at most a
         small fixed number of extra rounds repairing concrete blocking issues.
         """
+        self._emit_event("stage", {
+            "stage": "quality_gate", "label": "Final Gate",
+            "message": "Checking syntax and file interfaces; generated tests require separate execution.",
+        })
         findings = self._run_product_quality_diagnostics(code_directory)
         self.latest_quality_findings = findings
         blocking_findings = [
@@ -2720,7 +2760,7 @@ Requirements:
     ) -> None:
         """Check README command module paths against generated package modules."""
         content = file_path.read_text(encoding="utf-8", errors="ignore")
-        stdlib_or_tool_modules = self._stdlib_requirement_names() | {"pip", "venv"}
+        stdlib_or_tool_modules = self._stdlib_requirement_names() | {"pip", "venv", "pytest"}
         for module in re.findall(r"python\s+-m\s+([\w.]+)", content):
             if module.split(".", 1)[0] in stdlib_or_tool_modules:
                 continue

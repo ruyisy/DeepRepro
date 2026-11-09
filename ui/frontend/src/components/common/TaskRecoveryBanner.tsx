@@ -36,7 +36,7 @@ export function TaskRecoveryBanner({
   }
 
   // Don't show if task is completed or has error
-  if (status === 'completed' || status === 'error' || status === 'idle') {
+  if (status === 'completed' || status === 'error' || status === 'idle' || status === 'cancelled' || status === 'paused') {
     return null;
   }
 

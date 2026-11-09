@@ -27,11 +27,33 @@ export interface WorkflowStatusResponse {
   task_id: string;
   status: string;
   progress: number;
+  can_resume?: boolean;
+  attempts?: number;
+  completed_stages?: string[];
   message: string;
   result?: Record<string, unknown>;
   error?: string;
   started_at?: string;
   completed_at?: string;
+  metrics?: RunMetrics;
+  artifacts?: Record<string, unknown>;
+  events?: Array<{ event: string; payload: Record<string, unknown> }>;
+  workflow_mode?: PaperToCodeStartRequest['workflow_mode'];
+}
+
+export interface RunMetrics {
+  elapsed_seconds: number;
+  llm_calls: number;
+  failed_calls: number;
+  usage_reported_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_tokens: number;
+  llm_seconds: number;
+  stage_seconds: Record<string, number>;
+  models: string[];
+  scope: string;
 }
 
 export interface Question {

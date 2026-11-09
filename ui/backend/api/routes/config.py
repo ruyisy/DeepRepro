@@ -129,14 +129,15 @@ async def set_llm_config(request: LLMConfigUpdateRequest):
 
         if request.api_key.strip():
             secrets.setdefault(request.provider, {})["api_key"] = request.api_key.strip()
-        elif request.provider in secrets and "api_key" in secrets[request.provider]:
-            secrets[request.provider].pop("api_key", None)
+        # The UI deliberately never reads credentials back. A blank field means
+        # keep the saved key, as promised by its placeholder.
 
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
 
         with open(SECRETS_PATH, "w", encoding="utf-8") as f:
             yaml.safe_dump(secrets, f, allow_unicode=True, sort_keys=False)
+        SECRETS_PATH.chmod(0o600)
 
         return {
             "status": "success",

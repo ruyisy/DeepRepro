@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
 import {
   AlertCircle,
@@ -34,6 +34,8 @@ import { useStreaming } from '../hooks/useStreaming';
 import { workflowsApi } from '../services/api';
 import { toast } from '../components/common/Toaster';
 import { PAPER_TO_CODE_STEPS, type WorkflowStep } from '../types/workflow';
+import { RunMetricsPanel } from '../components/results/RunMetricsPanel';
+import { RunArtifacts } from '../components/results/RunArtifacts';
 
 type InputMethod = 'file' | 'url';
 type WorkflowMode = 'raw_fast' | 'infer_fast' | 'raw_deepplan' | 'infer_deepplan';
@@ -792,12 +794,14 @@ export default function PaperToCodePage() {
   const [batchQueue, setBatchQueue] = useState<BatchQueueItem[]>([]);
   const [activeBatchIndex, setActiveBatchIndex] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  const notifiedRun = useRef('');
 
   const {
     activeTaskId,
     status,
     message,
     startedAt,
+    runElapsedSeconds,
     completedAt,
     steps,
     generatedFiles,
@@ -816,6 +820,34 @@ export default function PaperToCodePage() {
   } = useWorkflowStore();
 
   useStreaming(activeTaskId);
+
+  const openRun = async (taskId: string) => {
+    const snapshot = await workflowsApi.getStatus(taskId);
+    reset();
+    setSteps(PAPER_TO_CODE_STEPS);
+    setActiveTask(taskId, 'paper-to-code');
+    const store = useWorkflowStore.getState();
+    for (const event of snapshot.events || []) {
+      store.addDeepReproEvent(event.event, event.payload);
+      if (event.event === 'stage') store.addActivityLog(String(event.payload.message || event.payload.label || 'Restored stage'), 0, 'info');
+    }
+    if (snapshot.artifacts) store.addDeepReproEvent('artifact', snapshot.artifacts);
+    store.updateProgress(snapshot.progress, snapshot.message);
+    store.setResult(snapshot.result || null);
+    store.setError(snapshot.error || null);
+    store.setStatus(snapshot.status === 'pending' ? 'running' : snapshot.status as 'running' | 'completed' | 'error' | 'cancelled' | 'paused');
+    if (snapshot.workflow_mode) setWorkflowMode(snapshot.workflow_mode);
+    useWorkflowStore.setState({
+      runElapsedSeconds: snapshot.metrics?.elapsed_seconds ?? null,
+      startedAt: snapshot.started_at ? Date.parse(`${snapshot.started_at.replace(/Z$/, '')}Z`) : null,
+      completedAt: snapshot.completed_at ? Date.parse(`${snapshot.completed_at.replace(/Z$/, '')}Z`) : null,
+    });
+  };
+
+  useEffect(() => {
+    const taskId = new URLSearchParams(window.location.search).get('task');
+    if (taskId) void openRun(taskId).catch(() => toast.error('Run unavailable', 'The saved run could not be loaded.'));
+  }, []);
 
   const selectedMode = WORKFLOW_MODE_OPTIONS.find((mode) => mode.value === workflowMode) || WORKFLOW_MODE_OPTIONS[0];
   const isRunning = status === 'running';
@@ -838,11 +870,12 @@ export default function PaperToCodePage() {
   );
   const visibleGeneratedFiles = implementedFiles.length ? implementedFiles : generatedFiles;
   const runtimeSeconds = useMemo(() => {
+    if (runElapsedSeconds !== null) return Math.floor(runElapsedSeconds);
     if (!startedAt) return 0;
     const end = completedAt || (status === 'running' ? now : null);
     if (!end) return 0;
     return Math.max(0, Math.floor((end - startedAt) / 1000));
-  }, [startedAt, completedAt, status, now]);
+  }, [startedAt, completedAt, status, now, runElapsedSeconds]);
   const runtimeLabel = useMemo(() => {
     const hours = Math.floor(runtimeSeconds / 3600);
     const minutes = Math.floor((runtimeSeconds % 3600) / 60);
@@ -903,12 +936,16 @@ export default function PaperToCodePage() {
   }, [status, startedAt, completedAt]);
 
   useEffect(() => {
+    const notificationKey = `${activeTaskId}:${status}`;
+    if (notifiedRun.current === notificationKey) return;
     if (status === 'completed' && result) {
+      notifiedRun.current = notificationKey;
       toast.success('DeepRepro run complete', 'The reproduction workspace is ready.');
     } else if (status === 'error' && error) {
+      notifiedRun.current = notificationKey;
       toast.error('Processing failed', error);
     }
-  }, [status, error, result]);
+  }, [activeTaskId, status, error, result]);
 
   useEffect(() => {
     if (activeBatchIndex === null || batchQueue.length === 0) return;
@@ -958,14 +995,13 @@ export default function PaperToCodePage() {
     if (!activeTaskId) return;
     setIsCancelling(true);
     try {
-      await workflowsApi.cancel(activeTaskId);
-      setStatus('idle');
+      await workflowsApi.pause(activeTaskId);
+      setStatus('paused');
       setBatchQueue([]);
       setActiveBatchIndex(null);
-      reset();
-      toast.info('Task cancelled', 'The workflow has been stopped.');
+      toast.info('Progress saved', 'Resume this run when ready.');
     } catch {
-      toast.error('Cancel failed', 'Could not cancel the task.');
+      toast.error('Pause failed', 'Could not pause the task.');
     } finally {
       setIsCancelling(false);
       setShowCancelDialog(false);
@@ -1339,7 +1375,7 @@ export default function PaperToCodePage() {
                 className="inline-flex h-12 items-center justify-center rounded-2xl border border-red-200 bg-red-50 px-4 text-sm font-semibold text-red-700 transition hover:bg-red-100 disabled:opacity-60"
               >
                 <StopCircle className="mr-2 h-4 w-4" />
-                Stop
+                Pause
               </button>
             )}
           </div>
@@ -1418,7 +1454,7 @@ export default function PaperToCodePage() {
                   {isRunning ? 'Live' : status}
                 </span>
               </div>
-              <StageTimeline steps={steps} activeStageTitle={activeStage.title} />
+              <StageTimeline steps={steps.filter((step) => isIndexed || step.id !== 'reference')} activeStageTitle={activeStage.title} />
             </div>
 
             <div className="space-y-3">
@@ -1554,15 +1590,28 @@ export default function PaperToCodePage() {
               </div>
             </div>
 
+            <div className="flex justify-end">
+              <button className="text-sm font-medium text-emerald-800 underline" onClick={async () => {
+                try {
+                  const recent = await workflowsApi.getRecentTasks(1);
+                  if (recent.tasks[0]) await openRun(recent.tasks[0].task_id);
+                  else toast.info('No saved runs', 'Start a new run first.');
+                } catch { toast.error('Run unavailable', 'Could not load the latest run.'); }
+              }}>Open latest run</button>
+            </div>
+            <RunMetricsPanel taskId={activeTaskId} status={status} />
+            {['paused', 'error'].includes(status) && activeTaskId && artifacts.codeDirectory && <RunArtifacts key={`${activeTaskId}:${status}`} taskId={activeTaskId} />}
+
             {status === 'completed' && result && (
               <div className="rounded-[2rem] border border-emerald-200 bg-emerald-50 p-5">
                 <div className="flex items-start gap-3">
                   <CheckCircle className="mt-0.5 h-6 w-6 text-emerald-600" />
                   <div>
-                    <p className="font-semibold text-emerald-950">DeepRepro completed the reproduction run.</p>
+                    <p className="font-semibold text-emerald-950">DeepRepro completed code generation.</p>
                     <p className="mt-1 text-sm text-emerald-700">
                       Final reports and generated code are available in the workspace.
                     </p>
+                    {activeTaskId && <RunArtifacts taskId={activeTaskId} />}
                   </div>
                 </div>
               </div>
@@ -1585,9 +1634,9 @@ export default function PaperToCodePage() {
 
       <ConfirmDialog
         isOpen={showCancelDialog}
-        title="Stop DeepRepro run?"
-        message="The backend task will be cancelled. Generated partial artifacts may remain in the workspace."
-        confirmLabel="Stop run"
+        title="Pause DeepRepro run?"
+        message="Completed stages and files are saved. Resume will retry the unfinished step in the same workspace."
+        confirmLabel="Pause run"
         cancelLabel="Keep running"
         variant="danger"
         onConfirm={handleCancelTask}

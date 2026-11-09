@@ -63,6 +63,7 @@ interface WorkflowState {
   progress: number;
   message: string;
   startedAt: number | null;
+  runElapsedSeconds: number | null;
   completedAt: number | null;
 
   // Steps
@@ -136,6 +137,7 @@ const initialState = {
   activeTaskId: null,
   workflowType: null as 'paper-to-code' | null,
   status: 'idle' as WorkflowStatus,
+  runElapsedSeconds: null,
   progress: 0,
   message: '',
   startedAt: null,
@@ -189,9 +191,14 @@ export const useWorkflowStore = create<WorkflowState>()(
     const state = get();
     set({
       status,
+      agentState: status === 'running' ? state.agentState : {
+        ...state.agentState, planner: 'idle', executor: 'idle', memory: 'idle', activeRole: 'idle',
+        message: status === 'paused' ? 'Progress saved. Ready to resume.' : '',
+        memoryMessage: status === 'paused' ? 'Summary requests stopped; saved files are retained.' : '',
+      },
       startedAt: status === 'running' && !state.startedAt ? Date.now() : state.startedAt,
       completedAt:
-        status === 'completed' || status === 'error' || status === 'cancelled'
+        status === 'completed' || status === 'error' || status === 'cancelled' || status === 'paused'
           ? Date.now()
           : status === 'running'
           ? null
@@ -273,6 +280,16 @@ export const useWorkflowStore = create<WorkflowState>()(
 
   addDeepReproEvent: (event, payload, schemaVersion) =>
     set((state) => {
+      // Older saved runs contain both absolute and relative file names.
+      const normalizeFile = (value: unknown) => String(value).replace(/\\/g, '/').split('/generate_code/').pop()!.replace(/^\.\//, '');
+      payload = { ...payload };
+      for (const key of ['all_files', 'planned_files', 'completed_files', 'completed_files_this_round']) {
+        if (Array.isArray(payload[key])) payload[key] = Array.from(new Set((payload[key] as unknown[]).map(normalizeFile)));
+      }
+      for (const key of ['current_file', 'repair_file']) {
+        if (payload[key]) payload[key] = normalizeFile(payload[key]);
+      }
+      if (Array.isArray(payload.all_files)) payload.total_files = payload.all_files.length;
       const nextEvent: DeepReproEvent = {
         id: `deeprepro-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         timestamp: new Date(),
@@ -475,7 +492,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       name: 'deeprepro-workflow',
       // Only persist task-related data for recovery when task is running or waiting
       partialize: (state) => {
-        const isActive = state.status === 'running' || state.isWaitingForInput;
+        const isActive = Boolean(state.activeTaskId);
         return {
           // Only persist activeTaskId if task is still running or waiting for input
           // This prevents trying to recover completed/errored tasks
@@ -487,6 +504,15 @@ export const useWorkflowStore = create<WorkflowState>()(
           completedAt: isActive ? state.completedAt : null,
           steps: isActive ? state.steps : [],
           isWaitingForInput: state.isWaitingForInput,
+          result: state.result,
+          error: state.error,
+          roundTraces: state.roundTraces,
+          artifacts: state.artifacts,
+          currentStage: state.currentStage,
+          fileProgress: state.fileProgress,
+          generatedFiles: state.generatedFiles,
+          activityLogs: state.activityLogs,
+          agentState: state.agentState,
         };
       },
     }

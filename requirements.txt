@@ -7,8 +7,10 @@ asyncio-mqtt
 # New UI Backend Dependencies
 fastapi>=0.104.0
 google-genai
-mcp-agent
-mcp-server-git
+mcp-agent==0.2.6
+# mcp-agent 0.2.x and local FastMCP servers use the v1 SDK API.
+mcp>=1.10,<2
+mcp-server-git<2026
 nest_asyncio
 openai
 pathlib2

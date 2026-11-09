@@ -10,7 +10,7 @@ import type {
   WSDeepReproEventMessage,
 } from '../types/api';
 
-type WSMessage = WSProgressMessage | WSCompleteMessage | WSErrorMessage | WSCodeChunkMessage | WSInteractionMessage | WSDeepReproEventMessage;
+type WSMessage = WSProgressMessage | WSCompleteMessage | WSErrorMessage | WSCodeChunkMessage | WSInteractionMessage | WSDeepReproEventMessage | { type: 'cancelled' | 'paused'; task_id: string };
 
 export function useStreaming(taskId: string | null) {
   const {
@@ -32,7 +32,7 @@ export function useStreaming(taskId: string | null) {
   const prevTaskIdRef = useRef<string | null>(null);
 
   // Determine if finished based on store status (persisted state)
-  const isFinished = status === 'completed' || status === 'error';
+  const isFinished = status === 'completed' || status === 'error' || status === 'cancelled' || status === 'paused';
 
   const handleMessage = useCallback(
     (message: WSMessage) => {
@@ -44,6 +44,12 @@ export function useStreaming(taskId: string | null) {
       console.log('[useStreaming] Received message:', message.type, message);
 
       switch (message.type) {
+        case 'paused':
+        case 'cancelled':
+          setStatus(message.type);
+          clearInteraction();
+          addActivityLog(message.type === 'paused' ? 'Progress saved. Ready to resume.' : 'Workflow cancelled', 0, 'info');
+          break;
         case 'progress':
           if ('progress' in message && message.progress !== undefined) {
             updateProgress(message.progress, message.message || '');
@@ -179,7 +185,7 @@ export function useStreaming(taskId: string | null) {
     if (taskId && taskId !== prevTaskIdRef.current) {
       console.log('[useStreaming] taskId changed from', prevTaskIdRef.current, 'to', taskId, '- resetting to running');
       prevTaskIdRef.current = taskId;
-      setStatus('running');
+      if (!['completed', 'error', 'cancelled', 'paused'].includes(useWorkflowStore.getState().status)) setStatus('running');
     } else if (!taskId) {
       prevTaskIdRef.current = null;
     }

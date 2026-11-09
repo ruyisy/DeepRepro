@@ -65,6 +65,9 @@ class SettingsResponse(BaseModel):
     document_segmentation: Dict[str, Any]
     api_base_urls: Dict[str, str] = Field(default_factory=dict)
     providers: List[str] = Field(default_factory=list)
+    api_key_configured: Dict[str, bool] = Field(default_factory=dict)
+    provider_models: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+    configuration_locked: bool = False
 
 
 class ErrorResponse(BaseModel):

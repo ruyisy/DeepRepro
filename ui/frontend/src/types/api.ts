@@ -84,6 +84,9 @@ export interface SettingsResponse {
   document_segmentation: Record<string, unknown>;
   api_base_urls?: Record<string, string>;
   providers?: string[];
+  api_key_configured?: Record<string, boolean>;
+  provider_models?: Record<string, Record<string, string>>;
+  configuration_locked?: boolean;
 }
 
 export interface LLMConfigUpdateRequest {

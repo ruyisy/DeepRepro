@@ -5,6 +5,8 @@ Handles LLM provider and settings management
 
 from fastapi import APIRouter, HTTPException
 import yaml
+from urllib.parse import urlparse
+from utils.checkpoints import atomic_write
 
 from settings import (
     load_mcp_config,
@@ -20,6 +22,27 @@ from models.responses import ConfigResponse, SettingsResponse
 
 
 router = APIRouter()
+
+
+def configuration_is_locked():
+    from services.workflow_service import workflow_service
+    return bool(workflow_service.get_active_tasks())
+
+
+def check_configuration_unlocked():
+    if configuration_is_locked():
+        raise HTTPException(status_code=409, detail="Pause the running task before changing model settings.")
+
+
+def api_origin(provider, base_url):
+    defaults = {"openai": "https://api.openai.com", "anthropic": "https://api.anthropic.com", "google": "https://generativelanguage.googleapis.com"}
+    parsed = urlparse(base_url or defaults[provider])
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise HTTPException(status_code=400, detail="Enter an HTTP(S) API base URL without credentials, query parameters or a fragment.")
+    try:
+        return parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="The API base URL has an invalid port.")
 
 
 @router.get("/settings", response_model=SettingsResponse)
@@ -42,6 +65,9 @@ async def get_settings():
         document_segmentation=config.get("document_segmentation", {}),
         api_base_urls=api_base_urls,
         providers=["google", "anthropic", "openai"],
+        api_key_configured={name: bool(secrets.get(name, {}).get("api_key")) for name in ("openai", "google", "anthropic")},
+        provider_models={name: get_llm_models(name) for name in ("openai", "google", "anthropic")},
+        configuration_locked=configuration_is_locked(),
     )
 
 
@@ -70,6 +96,7 @@ async def get_llm_providers():
 @router.put("/llm-provider")
 async def set_llm_provider(request: LLMProviderUpdateRequest):
     """Update the preferred LLM provider"""
+    check_configuration_unlocked()
     secrets = load_secrets()
 
     # Verify provider has an API key
@@ -104,11 +131,21 @@ async def set_llm_provider(request: LLMProviderUpdateRequest):
 async def set_llm_config(request: LLMConfigUpdateRequest):
     """Update the preferred LLM provider and model configuration."""
     try:
+        check_configuration_unlocked()
         config = load_mcp_config()
         secrets = load_secrets()
 
         if request.provider not in {"google", "anthropic", "openai"}:
             raise HTTPException(status_code=400, detail="Unsupported provider")
+
+        saved = secrets.get(request.provider, {})
+        if not request.default_model.strip():
+            raise HTTPException(status_code=400, detail="Enter a default model ID.")
+        if not (request.api_key.strip() or saved.get("api_key")):
+            raise HTTPException(status_code=400, detail="Enter an API key for this connection.")
+        new_origin = api_origin(request.provider, request.base_url.strip())
+        if saved.get("api_key") and not request.api_key.strip() and new_origin != api_origin(request.provider, saved.get("base_url", "")):
+            raise HTTPException(status_code=400, detail="The API address changed. Enter a key for the new API host; the saved key will not be reused automatically.")
 
         config["llm_provider"] = request.provider
         provider_config = config.setdefault(request.provider, {})
@@ -132,12 +169,9 @@ async def set_llm_config(request: LLMConfigUpdateRequest):
         # The UI deliberately never reads credentials back. A blank field means
         # keep the saved key, as promised by its placeholder.
 
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
-
-        with open(SECRETS_PATH, "w", encoding="utf-8") as f:
-            yaml.safe_dump(secrets, f, allow_unicode=True, sort_keys=False)
+        atomic_write(SECRETS_PATH, yaml.safe_dump(secrets, allow_unicode=True, sort_keys=False))
         SECRETS_PATH.chmod(0o600)
+        atomic_write(CONFIG_PATH, yaml.safe_dump(config, allow_unicode=True, sort_keys=False))
 
         return {
             "status": "success",

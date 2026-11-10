@@ -1,12 +1,12 @@
 $schema: ./schema/mcp-agent.config.schema.json
 anthropic: null
-default_search_server: brave
+default_search_server: none
 document_segmentation:
   enabled: true
   size_threshold_chars: 50000
 execution_engine: asyncio
 logger:
-  level: debug
+  level: info
   progress_display: false
   transports:
   - console
@@ -110,10 +110,10 @@ llm_provider: "openai"
 #openrouter can be used here and openai professional key
 openai:
   base_max_tokens: 40000
-  default_model: "gpt-5.4"
-  planning_model: "gpt-5.4"
-  implementation_model: "deepseek-v4-flash"
-  subplan_model: "gpt-5.4"
+  default_model: "deepseek-flash"
+  planning_model: "deepseek-flash"
+  implementation_model: "deepseek-flash"
+  subplan_model: "deepseek-flash"
   reasoning_effort: high  # Only for thinking models
   max_tokens_policy: adaptive
   retry_max_tokens: 32768

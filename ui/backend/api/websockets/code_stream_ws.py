@@ -106,7 +106,7 @@ async def code_stream_websocket(websocket: WebSocket, task_id: str):
                             }
                         )
 
-                    elif message.get("type") in ("complete", "error"):
+                    elif message.get("type") in ("complete", "error", "cancelled", "paused"):
                         msg_type = message.get("type")
                         print(
                             f"[CodeStreamWS] Workflow finished: task={task_id[:8]}... type={msg_type}"

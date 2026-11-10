@@ -25,6 +25,9 @@ import shutil
 import logging
 from datetime import datetime
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.checkpoints import atomic_write
+
 # Set standard output encoding to UTF-8
 if sys.stdout.encoding != "utf-8":
     try:
@@ -430,8 +433,7 @@ async def write_file(
             backup_created = True
 
         # Write file
-        with open(full_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        atomic_write(full_path, content)
 
         # Update current file record
         CURRENT_FILES[file_path] = {

@@ -43,6 +43,7 @@ from fastapi.responses import FileResponse
 
 from settings import settings
 from api.routes import workflows, config as config_routes, files
+from api.routes import artifacts
 from api.websockets import workflow_ws, code_stream_ws, logs_ws
 
 # Check if running in Docker/production mode
@@ -71,6 +72,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    from services.workflow_service import workflow_service
+    await workflow_service.shutdown()
     print("Shutting down DeepRepro API...")
 
 
@@ -96,6 +99,7 @@ app.include_router(
     config_routes.router, prefix="/api/v1/config", tags=["Configuration"]
 )
 app.include_router(files.router, prefix="/api/v1/files", tags=["Files"])
+app.include_router(artifacts.router, prefix="/api/v1/artifacts", tags=["Artifacts"])
 
 # Include WebSocket routes
 app.include_router(workflow_ws.router, prefix="/ws", tags=["WebSocket"])

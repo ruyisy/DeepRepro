@@ -1,0 +1,9 @@
+paperbench-*.md
+pdf-ingestion/
+original-generated-code/
+*run.json
+*request.json
+*output.json
+*.png
+*output.txt
+recovery-*.json

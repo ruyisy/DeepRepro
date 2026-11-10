@@ -110,6 +110,14 @@ export function useTaskRecovery() {
           error: taskStatus.error || null,
         });
 
+      } else if (taskStatus.status === 'paused' || taskStatus.status === 'cancelled') {
+        setStatus(taskStatus.status);
+        updateProgress(taskStatus.progress, taskStatus.message);
+        setNeedsRecovery(false);
+        setRecoveryState({ isRecovering: false, recoveredTaskId: activeTaskId, error: null });
+      } else if (taskStatus.status === 'pending') {
+        setStatus('running');
+        setRecoveryState({ isRecovering: false, recoveredTaskId: activeTaskId, error: null });
       } else {
         // Unknown status, reset
         console.log('[TaskRecovery] Unknown task status, resetting...');
@@ -128,12 +136,10 @@ export function useTaskRecovery() {
       // Always reset on any error - the task is no longer valid
       // This handles 404 (task not found) and any other API errors
       console.log('[TaskRecovery] Task not recoverable, clearing state...');
-      reset();
-
       setRecoveryState({
         isRecovering: false,
-        recoveredTaskId: null,
-        error: null, // Don't show error - just clear state
+        recoveredTaskId: activeTaskId,
+        error: 'Backend unavailable; saved task is retained and status polling will reconnect.',
       });
     }
   }, [activeTaskId, workflowType, status, setActiveTask, setStatus, setSteps, updateProgress, setResult, setError, setNeedsRecovery, reset]);

@@ -10,11 +10,16 @@ no naming conflicts (config.py -> settings.py, utils/ -> app_utils/).
 import asyncio
 import uuid
 import os
+import json
+import sys
+from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, Callable, List
 from dataclasses import dataclass, field
 
 from settings import CONFIG_PATH, PROJECT_ROOT
+from utils.run_metrics import RunMetrics, current_metrics
+from utils.checkpoints import save_json
 
 
 DEEPREPRO_EVENT_SCHEMAS: Dict[str, int] = {
@@ -39,6 +44,16 @@ class WorkflowTask:
     error: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    metrics: Optional[RunMetrics] = None
+    artifacts: Dict[str, Any] = field(default_factory=dict)
+    runner: Optional[asyncio.Task] = field(default=None, repr=False)
+    events: List[Dict[str, Any]] = field(default_factory=list)
+    workflow_mode: str = "raw_fast"
+    saved_metrics: Dict[str, Any] = field(default_factory=dict)
+    saved_requests: List[Dict[str, Any]] = field(default_factory=list)
+    request: Dict[str, Any] = field(default_factory=dict)
+    checkpoint: Dict[str, Any] = field(default_factory=dict)
+    attempts: int = 0
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     # User-in-Loop support
     pending_interaction: Optional[Dict[str, Any]] = (
@@ -82,6 +97,87 @@ class WorkflowService:
         # User-in-Loop plugin integration (lazy loaded)
         self._plugin_integration = None
         self._plugin_enabled = True  # Can be disabled via config
+        self._restore_runs()
+
+    def _restore_runs(self):
+        for path in (PROJECT_ROOT / "logs" / "runs").glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                task = WorkflowTask(task_id=data["task_id"], status=data["status"])
+                task.result, task.error = data.get("result"), data.get("error")
+                task.artifacts = data.get("artifacts") or {
+                    k: v for k, v in (task.result or {}).items()
+                    if k.endswith("_path") or k == "code_directory"
+                }
+                task.events = data.get("events", [])
+                task.workflow_mode = data.get("workflow_mode", "raw_fast")
+                task.saved_metrics = data.get("metrics", {})
+                task.saved_requests = data.get("requests", [])
+                task.request = data.get("request", {})
+                task.checkpoint = data.get("checkpoint", {})
+                task.attempts = data.get("attempts", 1)
+                task.progress = 100 if task.status == "completed" else data.get("progress", 0)
+                task.message = data.get("message", task.status)
+                for name in ("started_at", "completed_at"):
+                    if data.get(name):
+                        setattr(task, name, datetime.fromisoformat(data[name].rstrip("Z")))
+                if task.status in {"running", "pending", "waiting_for_input"}:
+                    task.status = "paused"
+                    task.message = "Service restarted. Resume from the last saved checkpoint."
+                self._tasks[task.task_id] = task
+                self._subscribers[task.task_id] = []
+            except (ValueError, KeyError, TypeError):
+                continue
+
+    def metrics_snapshot(self, task: WorkflowTask) -> Dict[str, Any]:
+        return task.metrics.snapshot() if task.metrics else task.saved_metrics
+
+    def _save_run(self, task: WorkflowTask):
+        """Keep reviewable usage and result records across backend restarts."""
+        directory = PROJECT_ROOT / "logs" / "runs"
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "task_id": task.task_id, "status": task.status,
+            "started_at": task.started_at.isoformat() + "Z" if task.started_at else None,
+            "completed_at": task.completed_at.isoformat() + "Z" if task.completed_at else None,
+            "result": task.result, "error": task.error,
+            "metrics": self.metrics_snapshot(task),
+            "artifacts": task.artifacts, "events": task.events,
+            "workflow_mode": task.workflow_mode, "progress": task.progress,
+            "message": task.message,
+            "requests": task.metrics.requests if task.metrics else task.saved_requests,
+            "request": task.request, "checkpoint": task.checkpoint,
+            "attempts": task.attempts,
+        }
+        save_json(directory / f"{task.task_id}.json", payload)
+
+    def prepare_task(self, task, request):
+        task.request = dict(request)
+        task.workflow_mode = request.get("workflow_mode", "raw_fast")
+        self._save_run(task)
+
+    def launch_task(self, task):
+        task.runner = asyncio.create_task(self.execute_paper_to_code(task.task_id, **task.request))
+
+    def resume_task(self, task_id):
+        task = self._tasks.get(task_id)
+        if not task or not task.request:
+            raise ValueError("No saved request is available for this task")
+        if task.status not in {"paused", "cancelled", "error"} or (task.runner and not task.runner.done()):
+            raise ValueError("Task is running or still stopping; retry in a moment")
+        task.cancel_event.clear()
+        task.status, task.error, task.result = "pending", None, None
+        task.completed_at = None
+        self._save_run(task)
+        self.launch_task(task)
+        return task
+
+    async def shutdown(self):
+        running = [task for task in self._tasks.values() if task.runner and not task.runner.done()]
+        for task in running:
+            self.cancel_task(task.task_id, pause=True)
+        if running:
+            await asyncio.gather(*(task.runner for task in running if task.runner), return_exceptions=True)
 
     def _get_plugin_integration(self):
         """Lazy load the plugin integration system."""
@@ -212,6 +308,15 @@ class WorkflowService:
         """Create a non-blocking DeepRepro telemetry callback for UI-only events."""
         def callback(event_type: str, payload: Dict[str, Any]):
             event_payload = payload if isinstance(payload, dict) else {"value": payload}
+            task = self._tasks.get(task_id)
+            if task:
+                if event_type == "stage" and task.metrics:
+                    task.metrics.set_stage(str(event_payload.get("stage", "unknown")))
+                elif event_type == "artifact":
+                    task.artifacts.update({key: value for key, value in event_payload.items() if value is not None})
+                task.events.append({"event": event_type, "payload": event_payload})
+                task.events = task.events[-1000:]
+                self._save_run(task)
             timestamp = datetime.utcnow().isoformat()
             asyncio.create_task(
                 self._broadcast(
@@ -244,6 +349,7 @@ class WorkflowService:
             if task:
                 task.progress = progress
                 task.message = message
+                self._save_run(task)
 
             # Broadcast to all subscribers
             asyncio.create_task(
@@ -272,8 +378,16 @@ class WorkflowService:
         planning_image_paths: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Execute paper-to-code workflow"""
-        async with self._workflow_lock:
-            return await self._execute_paper_to_code_unlocked(
+        task = self._tasks[task_id]
+        task.runner = asyncio.current_task()
+        if not task.request:
+            self.prepare_task(task, dict(input_source=input_source, input_type=input_type,
+                enable_indexing=enable_indexing, workflow_mode=workflow_mode,
+                supplementary_requirements=supplementary_requirements,
+                planning_image_paths=planning_image_paths))
+        try:
+            async with self._workflow_lock:
+                return await self._execute_paper_to_code_unlocked(
                 task_id,
                 input_source,
                 input_type,
@@ -281,7 +395,15 @@ class WorkflowService:
                 workflow_mode,
                 supplementary_requirements,
                 planning_image_paths,
-            )
+                )
+        except asyncio.CancelledError:
+            if task.status != "cancelled":
+                task.status = "paused"
+            task.message = "Progress saved. Resume when ready."
+            return {"status": task.status}
+        finally:
+            task.runner = None
+            self._save_run(task)
 
     async def _execute_paper_to_code_unlocked(
         self,
@@ -294,15 +416,11 @@ class WorkflowService:
         planning_image_paths: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Execute paper-to-code workflow without acquiring the serial workflow lock."""
-        # Lazy imports - workflow modules found via sys.path set in main.py
-        from mcp_agent.app import MCPApp
-        from workflows.agent_orchestration_engine import (
-            execute_multi_agent_research_pipeline,
-        )
-
         task = self._tasks.get(task_id)
         if not task:
             return {"status": "error", "error": "Task not found"}
+        if task.cancel_event.is_set():
+            return {"status": "cancelled"}
 
         original_cwd = os.getcwd()
         mode_to_settings = {
@@ -326,9 +444,26 @@ class WorkflowService:
 
         task.status = "running"
         task.message = f"Starting DeepRepro {workflow_mode} run"
-        task.started_at = datetime.utcnow()
+        task.started_at = task.started_at or datetime.utcnow()
+        task.workflow_mode = workflow_mode
+        task.metrics = RunMetrics.resume(self.metrics_snapshot(task), task.metrics.requests if task.metrics else task.saved_requests)
+        task.metrics.on_update = lambda: self._save_run(task)
+        task.attempts += 1
+        task.runner = asyncio.current_task()
+        metrics_token = current_metrics.set(task.metrics)
+
+        async def persist_running_metrics():
+            while True:
+                await asyncio.sleep(2)
+                self._save_run(task)
+
+        heartbeat = asyncio.create_task(persist_running_metrics())
 
         try:
+            # Import failures must become visible task errors, not stuck pending runs.
+            from mcp_agent.app import MCPApp
+            from workflows.agent_orchestration_engine import execute_multi_agent_research_pipeline
+
             progress_callback = await self._create_progress_callback(task_id)
             event_callback = self._create_deeprepro_event_callback(task_id)
 
@@ -354,10 +489,18 @@ class WorkflowService:
                 logger = agent_app.logger
                 context = agent_app.context
 
+                # Local MCP subprocesses must use the same virtualenv as the API.
+                for server in context.config.mcp.servers.values():
+                    if server.command in {"python", "python3"}:
+                        server.command = sys.executable
+
                 # Add current working directory to filesystem server args
                 context.config.mcp.servers["filesystem"].args.extend([os.getcwd()])
 
                 # Execute the pipeline
+                def checkpoint_callback(checkpoint):
+                    task.checkpoint = checkpoint
+                    self._save_run(task)
                 result = await execute_multi_agent_research_pipeline(
                     input_source,
                     logger,
@@ -367,6 +510,8 @@ class WorkflowService:
                     supplementary_requirements=supplementary_requirements or "",
                     planning_image_paths=planning_image_paths or [],
                     event_callback=event_callback,
+                    checkpoint=task.checkpoint,
+                    checkpoint_callback=checkpoint_callback,
                 )
 
                 result_text = str(result)
@@ -380,8 +525,12 @@ class WorkflowService:
                 task.result = {
                     "status": "error" if failed else "success",
                     "repo_result": result,
+                    **task.artifacts,
                 }
                 task.completed_at = datetime.utcnow()
+                task.metrics.finish()
+                task.result["metrics"] = self.metrics_snapshot(task)
+                task.message = "Workflow failed" if failed else "Workflow completed"
 
                 if failed:
                     task.error = result_text
@@ -409,9 +558,18 @@ class WorkflowService:
 
                 return task.result
 
+        except asyncio.CancelledError:
+            if task.status != "cancelled":
+                task.status = "paused"
+            task.message = "Progress saved. Resume when ready."
+            task.completed_at = datetime.utcnow()
+            await self._broadcast(task_id, {"type": task.status, "task_id": task_id})
+            return {"status": task.status}
+
         except Exception as e:
             task.status = "error"
             task.error = str(e)
+            task.message = "Run interrupted. Saved progress is available for retry."
             task.completed_at = datetime.utcnow()
 
             # Broadcast error signal to all subscribers
@@ -427,6 +585,12 @@ class WorkflowService:
             return {"status": "error", "error": str(e)}
 
         finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+            task.runner = None
+            task.metrics.finish()
+            current_metrics.reset(metrics_token)
+            self._save_run(task)
             # Restore original working directory
             os.chdir(original_cwd)
 
@@ -482,16 +646,21 @@ class WorkflowService:
                 ],
             }
 
-    def cancel_task(self, task_id: str) -> bool:
+    def cancel_task(self, task_id: str, pause: bool = False) -> bool:
         """Cancel a running task"""
         task = self._tasks.get(task_id)
-        if task and task.status == "running":
+        if task and task.status in {"pending", "running", "waiting_for_input"}:
             task.cancel_event.set()
-            task.status = "cancelled"
+            task.status = "paused" if pause else "cancelled"
+            task.message = "Saving progress…" if pause else "Workflow cancelled"
+            task.completed_at = datetime.utcnow()
+            if task.runner and not task.runner.done():
+                task.runner.cancel()
             for batch in self._batches.values():
                 if any(item.task_id == task_id for item in batch.items):
                     batch.cancel_event.set()
                     batch.status = "cancelled"
+            self._save_run(task)
             return True
         return False
 

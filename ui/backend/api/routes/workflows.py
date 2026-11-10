@@ -25,17 +25,9 @@ async def start_paper_to_code(
     """
     task = workflow_service.create_task()
 
-    # Run workflow in background
-    background_tasks.add_task(
-        workflow_service.execute_paper_to_code,
-        task.task_id,
-        request.input_source,
-        request.input_type,
-        request.enable_indexing,
-        request.workflow_mode,
-        request.supplementary_requirements,
-        request.planning_image_paths,
-    )
+    # Persist before accepting the request, then use a managed cancellable task.
+    workflow_service.prepare_task(task, request.model_dump())
+    workflow_service.launch_task(task)
 
     return TaskResponse(
         task_id=task.task_id,
@@ -107,6 +99,13 @@ async def get_workflow_status(task_id: str):
         "message": task.message,
         "result": task.result,
         "error": task.error,
+        "metrics": workflow_service.metrics_snapshot(task),
+        "artifacts": task.artifacts,
+        "events": task.events,
+        "workflow_mode": task.workflow_mode,
+        "can_resume": bool(task.request) and task.status in {"paused", "error", "cancelled"} and not (task.runner and not task.runner.done()),
+        "attempts": task.attempts,
+        "completed_stages": list(task.checkpoint.get("stages", {})),
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "completed_at": task.completed_at.isoformat() if task.completed_at else None,
     }
@@ -130,6 +129,22 @@ async def cancel_workflow(task_id: str):
         )
 
     return {"status": "cancelled", "task_id": task_id}
+
+
+@router.post("/pause/{task_id}")
+async def pause_workflow(task_id: str):
+    if not workflow_service.cancel_task(task_id, pause=True):
+        raise HTTPException(status_code=409, detail="Task is not running")
+    return {"status": "paused", "task_id": task_id}
+
+
+@router.post("/resume/{task_id}")
+async def resume_workflow(task_id: str):
+    try:
+        task = workflow_service.resume_task(task_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    return {"status": task.status, "task_id": task_id}
 
 
 @router.post("/respond/{task_id}")

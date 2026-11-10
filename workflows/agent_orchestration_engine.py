@@ -63,6 +63,7 @@ from workflows.agents.planning_image_agent import (
     save_planning_image_analysis,
 )
 from utils.workspace_paths import get_task_dir, get_workspace_dir, next_task_id
+from utils.checkpoints import atomic_write
 
 # Environment configuration
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"  # Prevent .pyc file generation
@@ -294,7 +295,8 @@ def get_search_server_names(
         List[str]: List of server names including the default search server
     """
     default_search = get_default_search_server()
-    server_names = [default_search]
+    # Paper analysis can run without a separately paid search provider.
+    server_names = [default_search] if default_search not in (None, "", "none", "disabled") else []
 
     if additional_servers:
         # Add additional servers, avoiding duplicates
@@ -527,9 +529,18 @@ async def run_resource_processor(analysis_result: str, logger) -> str:
         if input_type == "file" and source_path and os.path.exists(source_path):
             logger.info(f"📄 Direct file copy: {source_path} -> {paper_dir}")
             try:
-                operation_result = await move_file_to(
-                    source=source_path, destination=paper_dir, filename=f"{next_id}.pdf"
-                )
+                # Keep plain text as text: renaming Markdown to PDF made the
+                # converter fail and left the planner without the paper.
+                from pathlib import Path
+                import shutil
+
+                if Path(source_path).suffix.lower() in {".md", ".markdown", ".txt"}:
+                    shutil.copy2(source_path, os.path.join(paper_dir, f"{next_id}.md"))
+                    operation_result = "[SUCCESS] Paper text copied to workspace"
+                else:
+                    operation_result = await move_file_to(
+                        source=source_path, destination=paper_dir, filename=f"{next_id}.pdf"
+                    )
                 # Check if operation succeeded
                 if (
                     "[SUCCESS]" in operation_result
@@ -1413,8 +1424,7 @@ async def orchestrate_code_planning_agent(
             supplementary_requirements=supplementary_requirements,
             planning_image_summary=planning_image_summary,
         )
-        with open(initial_plan_path, "w", encoding="utf-8") as f:
-            f.write(initial_plan_result)
+        atomic_write(initial_plan_path, initial_plan_result)
         print(f"Initial plan saved to {initial_plan_path}")
 
 
@@ -1853,6 +1863,8 @@ async def execute_multi_agent_research_pipeline(
     supplementary_requirements: str = "",
     planning_image_paths: Optional[List[str]] = None,
     event_callback: Optional[Callable] = None,
+    checkpoint: Optional[dict] = None,
+    checkpoint_callback: Optional[Callable] = None,
 ) -> str:
     """
     Execute the complete intelligent multi-agent research orchestration pipeline.
@@ -1876,6 +1888,18 @@ async def execute_multi_agent_research_pipeline(
     Returns:
         str: The comprehensive pipeline execution result with status and outcomes
     """
+    checkpoint = checkpoint if checkpoint is not None else {}
+    stages = checkpoint.setdefault("stages", {})
+
+    async def saved_stage(name, action, *args):
+        if name in stages:
+            return stages[name]
+        value = await action(*args)
+        stages[name] = value
+        if checkpoint_callback:
+            checkpoint_callback(checkpoint)
+        return value
+
     try:
         # Phase 0: Workspace Setup
         if progress_callback:
@@ -1909,7 +1933,7 @@ async def execute_multi_agent_research_pipeline(
             print("⚡ Reference indexing disabled - DeepRepro will run the direct implementation path")
 
         # Phase 1: Input Processing and Validation
-        input_source = await _process_input_source(input_source, logger)
+        input_source = await saved_stage("input", _process_input_source, input_source, logger)
 
         # Phase 2: Research Analysis and Resource Processing (if needed)
         if event_callback:
@@ -1928,8 +1952,8 @@ async def execute_multi_agent_research_pipeline(
             (
                 analysis_result,
                 download_result,
-            ) = await orchestrate_research_analysis_agent(
-                input_source, logger, progress_callback
+            ) = await saved_stage(
+                "research", orchestrate_research_analysis_agent, input_source, logger, progress_callback
             )
         else:
             download_result = input_source  # Use input directly if already processed
@@ -1940,51 +1964,57 @@ async def execute_multi_agent_research_pipeline(
                 40, "🏗️ Synthesizing intelligent workspace infrastructure..."
             )
 
-        dir_info = await synthesize_workspace_infrastructure_agent(
-            download_result, logger, workspace_dir
+        dir_info = await saved_stage(
+            "workspace", synthesize_workspace_infrastructure_agent, download_result, logger, workspace_dir
         )
-        await asyncio.sleep(5)
+        if event_callback:
+            event_callback("artifact", {"code_directory": os.path.join(dir_info["paper_dir"], "generate_code")})
 
-        dir_info["planning_image_paths"] = []
-        dir_info["planning_image_summary"] = ""
-        dir_info["planning_image_analysis_path"] = None
-        dir_info["supplementary_requirements"] = supplementary_requirements or ""
+        if "images" not in stages:
+            dir_info["planning_image_paths"] = []
+            dir_info["planning_image_summary"] = ""
+            dir_info["planning_image_analysis_path"] = None
+            dir_info["supplementary_requirements"] = supplementary_requirements or ""
 
-        if planning_image_paths:
-            print("DeepRepro is processing user-supplied planning images...")
-            try:
-                copied_planning_image_paths = copy_planning_images_to_paper_dir(
-                    dir_info["paper_dir"], planning_image_paths, logger
-                )
-                dir_info["planning_image_paths"] = copied_planning_image_paths
-
-                if copied_planning_image_paths:
-                    planning_image_result = await analyze_planning_images(
-                        copied_planning_image_paths,
-                        logger=logger,
+            if planning_image_paths:
+                print("DeepRepro is processing user-supplied planning images...")
+                try:
+                    copied_planning_image_paths = copy_planning_images_to_paper_dir(
+                        dir_info["paper_dir"], planning_image_paths, logger
                     )
-                    dir_info["planning_image_summary"] = planning_image_result.get(
-                        "combined_summary", ""
-                    )
-                    dir_info["planning_image_analysis_path"] = (
-                        save_planning_image_analysis(
-                            dir_info["paper_dir"], planning_image_result, logger
+                    dir_info["planning_image_paths"] = copied_planning_image_paths
+
+                    if copied_planning_image_paths:
+                        planning_image_result = await analyze_planning_images(
+                            copied_planning_image_paths,
+                            logger=logger,
                         )
-                    )
+                        dir_info["planning_image_summary"] = planning_image_result.get(
+                            "combined_summary", ""
+                        )
+                        dir_info["planning_image_analysis_path"] = (
+                            save_planning_image_analysis(
+                                dir_info["paper_dir"], planning_image_result, logger
+                            )
+                        )
+                        print(
+                            f"   Planning image analysis status: {planning_image_result.get('status', 'unknown')}"
+                        )
+                    else:
+                        print("   No valid planning images were copied into the workspace")
+                except Exception as planning_image_error:
                     print(
-                        f"   Planning image analysis status: {planning_image_result.get('status', 'unknown')}"
+                        f"Planning image analysis skipped due to error: {planning_image_error}"
                     )
-                else:
-                    print("   No valid planning images were copied into the workspace")
-            except Exception as planning_image_error:
-                print(
-                    f"Planning image analysis skipped due to error: {planning_image_error}"
-                )
+
+            stages["images"] = True
+            if checkpoint_callback:
+                checkpoint_callback(checkpoint)
 
         # Phase 3.5: Document Segmentation and Preprocessing
 
-        segmentation_result = await orchestrate_document_preprocessing_agent(
-            dir_info, logger
+        segmentation_result = await saved_stage(
+            "preprocessing", orchestrate_document_preprocessing_agent, dir_info, logger
         )
 
         # Handle segmentation result
@@ -2017,7 +2047,7 @@ async def execute_multi_agent_research_pipeline(
                     "message": "Synthesizing the reproduction plan and target file tree.",
                 },
             )
-        await orchestrate_code_planning_agent(dir_info, logger, progress_callback)
+        await saved_stage("planning", orchestrate_code_planning_agent, dir_info, logger, progress_callback)
 
         # Phase 5: Reference Intelligence (only when indexing is enabled)
         if enable_indexing:
@@ -2030,8 +2060,8 @@ async def execute_multi_agent_research_pipeline(
                         "message": "Finding reference repositories and building searchable indexes.",
                     },
                 )
-            reference_result = await orchestrate_reference_intelligence_agent(
-                dir_info, logger, progress_callback
+            reference_result = await saved_stage(
+                "references", orchestrate_reference_intelligence_agent, dir_info, logger, progress_callback
             )
         else:
             print(
@@ -2047,8 +2077,8 @@ async def execute_multi_agent_research_pipeline(
 
         # Phase 6: Repository Acquisition Automation (optional)
         if enable_indexing:
-            await automate_repository_acquisition_agent(
-                reference_result, dir_info, logger, progress_callback
+            await saved_stage(
+                "repositories", automate_repository_acquisition_agent, reference_result, dir_info, logger, progress_callback
             )
         else:
             print(
@@ -2063,8 +2093,8 @@ async def execute_multi_agent_research_pipeline(
 
         # Phase 7: Codebase Intelligence Orchestration (optional)
         if enable_indexing:
-            index_result = await orchestrate_codebase_intelligence_agent(
-                dir_info, logger, progress_callback
+            index_result = await saved_stage(
+                "index", orchestrate_codebase_intelligence_agent, dir_info, logger, progress_callback
             )
         else:
             print(

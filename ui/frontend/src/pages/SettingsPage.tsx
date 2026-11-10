@@ -1,29 +1,23 @@
-import { useEffect, useMemo, useState } from 'react';
-import { motion } from 'framer-motion';
+import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Check, Cpu, KeyRound, Link2, Save, Server, ShieldCheck } from 'lucide-react';
+import { isAxiosError } from 'axios';
+import { ArrowLeft, CheckCircle2, KeyRound, Save, Settings2 } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { Button } from '../components/common';
 import { toast } from '../components/common/Toaster';
 import { configApi } from '../services/api';
+import type { SettingsResponse } from '../types/api';
 
-const PROVIDER_INFO: Record<string, { name: string; description: string; accent: string }> = {
-  openai: {
-    name: 'OpenAI-compatible',
-    description: 'OpenAI, DashScope compatible-mode, OpenRouter, and other compatible APIs.',
-    accent: 'from-cyan-400 to-blue-500',
-  },
-  google: {
-    name: 'Google Gemini',
-    description: 'Gemini models for planning, analysis, and implementation.',
-    accent: 'from-emerald-400 to-cyan-500',
-  },
-  anthropic: {
-    name: 'Anthropic Claude',
-    description: 'Claude models for careful planning and long-context reasoning.',
-    accent: 'from-violet-400 to-fuchsia-500',
-  },
+const API_FORMATS: Record<string, string> = {
+  openai: 'OpenAI-compatible',
+  google: 'Google Gemini API',
+  anthropic: 'Anthropic Messages API',
 };
-
+const DEFAULT_URLS: Record<string, string> = {
+  openai: 'https://api.openai.com/v1',
+  google: 'https://generativelanguage.googleapis.com',
+  anthropic: 'https://api.anthropic.com',
+};
 type SettingsForm = {
   provider: string;
   defaultModel: string;
@@ -33,261 +27,172 @@ type SettingsForm = {
   baseUrl: string;
   apiKey: string;
 };
-
 const EMPTY_FORM: SettingsForm = {
-  provider: 'openai',
-  defaultModel: '',
-  planningModel: '',
-  subplanModel: '',
-  implementationModel: '',
-  baseUrl: '',
-  apiKey: '',
+  provider: 'openai', defaultModel: '', planningModel: '', subplanModel: '',
+  implementationModel: '', baseUrl: '', apiKey: '',
 };
+function savedForm(settings: SettingsResponse, provider = settings.llm_provider): SettingsForm {
+  const models = settings.provider_models?.[provider] || (provider === settings.llm_provider ? settings.models : {});
+  return {
+    provider, defaultModel: models.default || '', planningModel: models.planning || '',
+    subplanModel: models.subplan || '', implementationModel: models.implementation || '',
+    baseUrl: settings.api_base_urls?.[provider] || '', apiKey: '',
+  };
+}
+function usesOneModel(form: SettingsForm) {
+  return [form.planningModel, form.subplanModel, form.implementationModel].every(model => !model || model === form.defaultModel);
+}
+function payload(form: SettingsForm, oneModel: boolean) {
+  const model = form.defaultModel.trim();
+  return {
+    provider: form.provider, default_model: model,
+    planning_model: oneModel ? model : form.planningModel.trim() || model,
+    subplan_model: oneModel ? model : form.subplanModel.trim() || model,
+    implementation_model: oneModel ? model : form.implementationModel.trim() || model,
+    base_url: form.baseUrl.trim(), api_key: form.apiKey.trim(),
+  };
+}
+function origin(provider: string, address: string) {
+  try { return new URL(address || DEFAULT_URLS[provider]).origin; } catch { return ''; }
+}
+function displayProvider(provider: string, address: string) {
+  const services: Record<string, string> = {
+    'api.deepseek.com': 'DeepSeek', 'api.openai.com': 'OpenAI',
+    'api.anthropic.com': 'Anthropic', 'generativelanguage.googleapis.com': 'Google Gemini',
+  };
+  try {
+    const host = new URL(address || DEFAULT_URLS[provider]).hostname;
+    return services[host] || host;
+  } catch { return 'Custom API'; }
+}
 
 export default function SettingsPage() {
   const queryClient = useQueryClient();
-  const [form, setForm] = useState<SettingsForm>(EMPTY_FORM);
-
-  const { data: settings, isLoading } = useQuery({
-    queryKey: ['settings'],
-    queryFn: configApi.getSettings,
+  const [form, setForm] = useState(EMPTY_FORM);
+  const [oneModel, setOneModel] = useState(true);
+  const [saveError, setSaveError] = useState('');
+  const hasEdits = useRef(false);
+  const { data: settings, isLoading, isError, refetch } = useQuery({
+    queryKey: ['settings'], queryFn: configApi.getSettings,
+    refetchOnWindowFocus: false, refetchInterval: 10000,
   });
-
+  useEffect(() => {
+    if (!settings || hasEdits.current) return;
+    const saved = savedForm(settings);
+    setForm(saved); setOneModel(usesOneModel(saved));
+  }, [settings]);
   const updateMutation = useMutation({
     mutationFn: configApi.updateLLMConfig,
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['settings'] });
-      queryClient.invalidateQueries({ queryKey: ['llm-providers'] });
-      toast.success('Settings saved', 'DeepRepro LLM configuration was updated.');
+      hasEdits.current = false;
+      setForm(current => ({ ...current, apiKey: '' }));
+      setSaveError('');
+      void queryClient.invalidateQueries({ queryKey: ['settings'] });
+      void queryClient.invalidateQueries({ queryKey: ['llm-providers'] });
+      toast.success('Settings saved', 'This configuration will be used when you start or resume a run.');
     },
     onError: (error) => {
-      toast.error('Failed to save settings', error instanceof Error ? error.message : 'Please try again.');
+      const message = isAxiosError(error) && typeof error.response?.data?.detail === 'string'
+        ? error.response.data.detail : 'Could not save settings. Check the backend connection and try again.';
+      setSaveError(message);
     },
   });
-
-  const providers = useMemo(
-    () => settings?.providers?.length ? settings.providers : ['openai', 'google', 'anthropic'],
-    [settings]
-  );
-
-  useEffect(() => {
+  const edit = (changes: Partial<SettingsForm>) => {
+    hasEdits.current = true; setSaveError('');
+    setForm(current => ({ ...current, ...changes }));
+  };
+  const reset = () => {
     if (!settings) return;
-    const provider = settings.llm_provider || 'openai';
-    setForm({
-      provider,
-      defaultModel: settings.models?.default || '',
-      planningModel: settings.models?.planning || '',
-      subplanModel: settings.models?.subplan || '',
-      implementationModel: settings.models?.implementation || '',
-      baseUrl: settings.api_base_urls?.[provider] || '',
-      apiKey: '',
-    });
-  }, [settings]);
-
+    const saved = savedForm(settings);
+    hasEdits.current = false; setForm(saved); setOneModel(usesOneModel(saved)); setSaveError('');
+  };
   const selectProvider = (provider: string) => {
-    setForm((current) => ({
-      ...current,
-      provider,
-      baseUrl: settings?.api_base_urls?.[provider] || '',
-      apiKey: '',
-    }));
+    if (!settings) return;
+    const saved = savedForm(settings, provider);
+    edit(saved); setOneModel(usesOneModel(saved));
   };
 
-  const updateField = (field: keyof SettingsForm, value: string) => {
-    setForm((current) => ({ ...current, [field]: value }));
-  };
+  if (isLoading) return <div className="flex min-h-screen items-center justify-center bg-[#f7efe0] text-stone-600" role="status">Loading saved settings…</div>;
+  if (!settings || isError) return <div className="min-h-screen bg-[#f7efe0] p-8"><div className="mx-auto max-w-3xl space-y-4">
+    <h1 className="text-2xl font-semibold">Settings unavailable</h1>
+    <p>Check that the DeepRepro backend is running. Your saved configuration has not changed.</p>
+    <Button onClick={() => void refetch()}>Try again</Button>
+  </div></div>;
 
-  const handleSave = () => {
-    updateMutation.mutate({
-      provider: form.provider,
-      default_model: form.defaultModel,
-      planning_model: form.planningModel,
-      subplan_model: form.subplanModel,
-      implementation_model: form.implementationModel,
-      base_url: form.baseUrl,
-      api_key: form.apiKey,
-    });
-  };
-
-  if (isLoading) {
-    return (
-      <div className="flex min-h-[60vh] items-center justify-center text-cyan-50">
-        <div className="h-10 w-10 animate-spin rounded-full border-2 border-cyan-300 border-t-transparent" />
-      </div>
-    );
+  const baseline = savedForm(settings);
+  const dirty = JSON.stringify(payload(form, oneModel)) !== JSON.stringify(payload(baseline, usesOneModel(baseline)));
+  const keySaved = Boolean(settings.api_key_configured?.[form.provider]);
+  const savedKey = Boolean(settings.api_key_configured?.[settings.llm_provider]);
+  const addressChanged = keySaved && origin(form.provider, form.baseUrl.trim()) !== origin(form.provider, settings.api_base_urls?.[form.provider] || '');
+  const locked = Boolean(settings.configuration_locked);
+  const readOnly = locked || updateMutation.isPending;
+  let validation = '';
+  if (!form.defaultModel.trim()) validation = 'Enter a model ID before saving.';
+  else if (!form.apiKey.trim() && (!keySaved || addressChanged)) validation = addressChanged
+    ? 'Enter an API key for the new API host. The saved key will not be reused automatically.'
+    : 'Enter an API key for this connection.';
+  if (form.baseUrl.trim()) {
+    try {
+      const url = new URL(form.baseUrl.trim());
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error();
+    } catch { validation = 'Enter a valid HTTP(S) base URL without credentials or query parameters.'; }
   }
+  const roleFields = [
+    ['planningModel', 'Paper planning', 'Builds the overall reproduction plan and file structure.'],
+    ['subplanModel', 'Round planning', 'Chooses the next files and repairs in DeepPlan mode.'],
+    ['implementationModel', 'Code implementation', 'Writes files and applies repairs.'],
+  ] as const;
 
-  return (
-    <div className="mx-auto max-w-6xl space-y-6 px-5 py-8 sm:px-8">
-      <motion.section
-        initial={{ opacity: 0, y: 12 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="relative overflow-hidden rounded-[2.5rem] border border-cyan-200/15 bg-slate-950 p-8 text-cyan-50 shadow-2xl shadow-cyan-950/25"
-      >
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_20%,rgba(34,211,238,0.22),transparent_28%),radial-gradient(circle_at_80%_10%,rgba(124,58,237,0.24),transparent_30%)]" />
-        <div className="relative flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
-          <div>
-            <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-cyan-200/15 bg-white/8 px-3 py-1 text-xs font-semibold text-cyan-100">
-              <ShieldCheck className="h-3.5 w-3.5" />
-              Runtime configuration
-            </div>
-            <h1 className="font-serif text-4xl font-semibold tracking-tight sm:text-5xl">
-              DeepRepro Settings
-            </h1>
-            <p className="mt-4 max-w-2xl text-sm leading-7 text-cyan-50/65">
-              Select an LLM provider and configure model names, compatible API address, and API key.
-              Changes are written to local configuration files and used by future runs.
-            </p>
-          </div>
-          <div className="rounded-3xl border border-white/10 bg-white/8 p-4 backdrop-blur">
-            <p className="text-xs uppercase tracking-[0.18em] text-cyan-50/45">Active provider</p>
-            <p className="mt-2 text-2xl font-semibold">{PROVIDER_INFO[form.provider]?.name || form.provider}</p>
-          </div>
+  return <div className="min-h-screen bg-[#f7efe0]"><div className="mx-auto max-w-4xl space-y-5 px-5 py-7 sm:px-8">
+    <Link to="/" className="inline-flex items-center gap-2 text-sm text-stone-600 hover:text-stone-950"><ArrowLeft className="h-4 w-4" />Back to workspace</Link>
+    <header>
+      <h1 className="font-serif text-3xl font-semibold text-stone-950 sm:text-4xl">Model & API settings</h1>
+      <p className="mt-2 text-sm leading-6 text-stone-600">Connect your API and choose a model. Saved changes apply when you start or resume a run.</p>
+    </header>
+
+    <section aria-label="Saved configuration" className="rounded-3xl bg-stone-950 p-5 text-white">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="text-xs font-medium uppercase tracking-widest text-stone-400">Currently saved</p>
+          <p className="mt-2 text-xl font-semibold">{displayProvider(settings.llm_provider, settings.api_base_urls?.[settings.llm_provider] || '')}<span className="mx-2 text-stone-500">/</span><span className="font-mono text-base text-emerald-200">{settings.models.default || 'No model set'}</span></p>
         </div>
-      </motion.section>
-
-      <div className="grid gap-6 lg:grid-cols-[0.95fr_1.05fr]">
-        <section className="rounded-[2rem] border border-stone-200 bg-white/80 p-5 shadow-sm backdrop-blur">
-          <div className="mb-5 flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-stone-950 text-cyan-200">
-              <Server className="h-5 w-5" />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold text-stone-950">Provider</h2>
-              <p className="text-sm text-stone-500">Choose the backend used for future DeepRepro tasks.</p>
-            </div>
-          </div>
-
-          <div className="space-y-3">
-            {providers.map((provider) => {
-              const info = PROVIDER_INFO[provider] || {
-                name: provider,
-                description: 'Custom provider',
-                accent: 'from-stone-400 to-stone-700',
-              };
-              const selected = form.provider === provider;
-              return (
-                <button
-                  key={provider}
-                  type="button"
-                  onClick={() => selectProvider(provider)}
-                  className={`w-full rounded-3xl border p-4 text-left transition ${
-                    selected
-                      ? 'border-stone-950 bg-stone-950 text-white shadow-xl shadow-stone-900/15'
-                      : 'border-stone-200 bg-white hover:border-stone-300'
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="flex items-start gap-3">
-                      <div className={`h-11 w-11 rounded-2xl bg-gradient-to-br ${info.accent}`} />
-                      <div>
-                        <p className={`font-semibold ${selected ? 'text-white' : 'text-stone-950'}`}>
-                          {info.name}
-                        </p>
-                        <p className={`mt-1 text-sm leading-6 ${selected ? 'text-cyan-50/62' : 'text-stone-500'}`}>
-                          {info.description}
-                        </p>
-                      </div>
-                    </div>
-                    {selected && <Check className="h-5 w-5 text-cyan-300" />}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </section>
-
-        <section className="rounded-[2rem] border border-stone-200 bg-white/80 p-5 shadow-sm backdrop-blur">
-          <div className="mb-5 flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-cyan-100 text-cyan-700">
-              <Cpu className="h-5 w-5" />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold text-stone-950">Models and credentials</h2>
-              <p className="text-sm text-stone-500">API keys are stored locally in `mcp_agent.secrets.yaml`.</p>
-            </div>
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <label className="space-y-2">
-              <span className="text-xs font-semibold uppercase tracking-[0.16em] text-stone-400">Default model</span>
-              <input
-                value={form.defaultModel}
-                onChange={(event) => updateField('defaultModel', event.target.value)}
-                placeholder="qwen3.5-plus"
-                className="input h-12 rounded-2xl"
-              />
-            </label>
-            <label className="space-y-2">
-              <span className="text-xs font-semibold uppercase tracking-[0.16em] text-stone-400">Planning model</span>
-              <input
-                value={form.planningModel}
-                onChange={(event) => updateField('planningModel', event.target.value)}
-                placeholder="qwen3.5-plus"
-                className="input h-12 rounded-2xl"
-              />
-            </label>
-            <label className="space-y-2">
-              <span className="text-xs font-semibold uppercase tracking-[0.16em] text-stone-400">Sub-plan model</span>
-              <input
-                value={form.subplanModel}
-                onChange={(event) => updateField('subplanModel', event.target.value)}
-                placeholder="qwen3.5-plus"
-                className="input h-12 rounded-2xl"
-              />
-            </label>
-            <label className="space-y-2 sm:col-span-2">
-              <span className="text-xs font-semibold uppercase tracking-[0.16em] text-stone-400">Execute model</span>
-              <input
-                value={form.implementationModel}
-                onChange={(event) => updateField('implementationModel', event.target.value)}
-                placeholder="qwen3.5-flash"
-                className="input h-12 rounded-2xl"
-              />
-            </label>
-            <label className="space-y-2 sm:col-span-2">
-              <span className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-stone-400">
-                <Link2 className="h-3.5 w-3.5" />
-                API base URL
-              </span>
-              <input
-                value={form.baseUrl}
-                onChange={(event) => updateField('baseUrl', event.target.value)}
-                placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"
-                className="input h-12 rounded-2xl"
-              />
-            </label>
-            <label className="space-y-2 sm:col-span-2">
-              <span className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-stone-400">
-                <KeyRound className="h-3.5 w-3.5" />
-                API key
-              </span>
-              <input
-                value={form.apiKey}
-                onChange={(event) => updateField('apiKey', event.target.value)}
-                placeholder="Leave blank to keep the current key"
-                type="password"
-                className="input h-12 rounded-2xl"
-              />
-            </label>
-          </div>
-
-          <div className="mt-6 flex flex-col gap-3 border-t border-stone-200 pt-5 sm:flex-row sm:items-center sm:justify-between">
-            <div className="text-xs leading-5 text-stone-500">
-              Blank API key clears the current provider key. Fill it when switching providers.
-            </div>
-            <Button
-              onClick={handleSave}
-              isLoading={updateMutation.isPending}
-              className="h-12 rounded-2xl bg-stone-950 px-5 hover:bg-stone-800"
-            >
-              <Save className="mr-2 h-4 w-4" />
-              Save settings
-            </Button>
-          </div>
-        </section>
+        <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium ${savedKey ? 'bg-emerald-400/15 text-emerald-200' : 'bg-amber-400/15 text-amber-200'}`}><KeyRound className="h-3.5 w-3.5" />{savedKey ? 'API key saved' : 'API key missing'}</span>
       </div>
+      <p className="mt-3 break-all text-xs text-stone-400">{settings.api_base_urls?.[settings.llm_provider] || 'Standard API address'}</p>
+    </section>
 
-    </div>
-  );
+    {locked && <p role="status" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">A task is running. Pause it before changing model settings.</p>}
+    <form onSubmit={event => { event.preventDefault(); if (!validation && dirty && !readOnly) updateMutation.mutate(payload(form, oneModel)); }} className="space-y-5">
+      <fieldset disabled={readOnly} className="rounded-3xl border border-stone-200 bg-white/85 p-5 sm:p-6 disabled:opacity-70">
+        <legend className="sr-only">API connection</legend>
+        <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+          <div><h2 className="text-lg font-semibold text-stone-950">1. API connection</h2><p className="mt-1 text-sm text-stone-500">Choose the API format. DeepSeek uses OpenAI-compatible; the base URL selects the service.</p></div>
+          <button type="button" onClick={() => { edit({provider: 'openai', baseUrl: 'https://api.deepseek.com', defaultModel: 'deepseek-flash', planningModel: 'deepseek-flash', subplanModel: 'deepseek-flash', implementationModel: 'deepseek-flash', apiKey: ''}); setOneModel(true); }} className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-800 hover:bg-emerald-100">Use DeepSeek Flash</button>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <label className="space-y-2 text-sm font-medium text-stone-800"><span>API format</span><select aria-label="API format" value={form.provider} onChange={e => selectProvider(e.target.value)} className="input h-12 rounded-xl">{Object.entries(API_FORMATS).map(([id, name]) => <option key={id} value={id}>{name}</option>)}</select></label>
+          <label className="space-y-2 text-sm font-medium text-stone-800"><span>API base URL</span><input aria-label="API base URL" type="text" value={form.baseUrl} onChange={e => edit({baseUrl:e.target.value})} placeholder={DEFAULT_URLS[form.provider]} className="input h-12 rounded-xl" /><span className="block text-xs font-normal text-stone-500">Leave blank for the standard API address. DeepSeek requires its own base URL.</span></label>
+          <label className="space-y-2 text-sm font-medium text-stone-800 sm:col-span-2"><span>API key</span><input aria-label="API key" type="password" autoComplete="off" spellCheck={false} value={form.apiKey} onChange={e => edit({apiKey:e.target.value})} placeholder={keySaved ? 'Leave blank to keep the saved key' : 'Enter your API key'} className="input h-12 rounded-xl" /><span className="block text-xs font-normal text-stone-500">{keySaved ? 'A key is saved for this API configuration. Leave blank to keep it, or enter a replacement.' : 'No key is saved for this API format.'} Stored on this computer; never displayed here.</span></label>
+        </div>
+      </fieldset>
+
+      <fieldset disabled={readOnly} className="rounded-3xl border border-stone-200 bg-white/85 p-5 sm:p-6 disabled:opacity-70">
+        <legend className="sr-only">Model selection</legend>
+        <h2 className="text-lg font-semibold text-stone-950">2. Model selection</h2>
+        <label className="mt-4 block space-y-2 text-sm font-medium text-stone-800"><span>Default model</span><input aria-label="Default model" value={form.defaultModel} onChange={e => edit({defaultModel:e.target.value})} placeholder={form.provider === 'openai' ? 'e.g. deepseek-flash' : 'Model ID from your API provider'} className="input h-12 rounded-xl" /><span className="block text-xs font-normal text-stone-500">Used for paper analysis and as the default for all agents. Enter the exact model ID from your API provider.</span></label>
+        <label className="mt-5 flex cursor-pointer items-start gap-3 rounded-2xl border border-stone-200 bg-stone-50 p-4"><input aria-label="Use the same model for all stages" type="checkbox" checked={oneModel} onChange={e => { hasEdits.current = true; setOneModel(e.target.checked); }} className="mt-1 h-4 w-4 accent-emerald-700" /><span><span className="text-sm font-semibold text-stone-900">Use the same model for all stages</span><span className="mt-1 block text-xs leading-5 text-stone-500">A simple setup for the demo. Uncheck to choose separate models for planning and code generation.</span></span></label>
+        {!oneModel && <div className="mt-5 space-y-4 border-t border-stone-200 pt-4"><p className="flex items-center gap-2 text-sm font-medium text-stone-700"><Settings2 className="h-4 w-4" />Per-stage models <span className="text-xs font-normal text-stone-500">Optional overrides</span></p>{roleFields.map(([field, label, hint]) => <label key={field} className="block space-y-2 text-sm font-medium text-stone-800"><span>{label}</span><input aria-label={label} value={form[field]} onChange={e => edit({[field]:e.target.value})} placeholder={form.defaultModel || 'Use the default model'} className="input h-11 rounded-xl" /><span className="block text-xs font-normal text-stone-500">{hint} Leave blank to use the default model.</span></label>)}</div>}
+      </fieldset>
+
+      <div className="rounded-3xl border border-stone-200 bg-white/90 p-5">
+        {validation && <p role="alert" className="mb-3 text-sm text-amber-800">{validation}</p>}
+        {saveError && <p role="alert" className="mb-3 text-sm text-red-700">{saveError}</p>}
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <p aria-live="polite" className={`inline-flex items-center gap-2 text-sm ${dirty ? 'text-amber-800' : 'text-stone-600'}`}>{!dirty && <CheckCircle2 className="h-4 w-4 text-emerald-700" />}{dirty ? 'Unsaved changes' : 'Saved configuration loaded'}</p>
+          <div className="flex items-center gap-3">{dirty && <Button type="button" variant="ghost" onClick={reset} disabled={readOnly}>Discard changes</Button>}<Button type="submit" disabled={!dirty || Boolean(validation) || locked} isLoading={updateMutation.isPending} className="h-11 rounded-xl bg-stone-950 px-5 hover:bg-stone-800"><Save className="mr-2 h-4 w-4" />Save settings</Button></div>
+        </div>
+        <p className="mt-3 text-xs text-stone-500">Saving stores your configuration; it does not test the API connection.</p>
+      </div>
+    </form>
+  </div></div>;
 }

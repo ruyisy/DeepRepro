@@ -259,7 +259,7 @@ def _initialize_openai_vision_client(
         logger.info("Planning image analysis skipped: no usable openai model configured.")
         return None, None
 
-    from openai import AsyncOpenAI
+    from utils.openai_client import AsyncOpenAI
 
     base_url = openai_config.get("base_url")
     if base_url:

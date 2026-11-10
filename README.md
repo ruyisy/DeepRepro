@@ -7,6 +7,7 @@
 ### State-Aware Subplanning for Paper Reproduction in Evolving Repositories
 
 <p>
+  <a href="https://youtu.be/ZvmtVX7Rleo">Demo Video</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#workflow-modes">Workflow Modes</a> ·
   <a href="#configuration">Configuration</a> ·
